@@ -94,3 +94,82 @@ Be data-driven, specific, and actionable. Use numbers wherever possible."""
         yield f"\n\n❌ **API Error ({e.status_code})**: {e.message}"
     except Exception as e:
         yield f"\n\n❌ **Unexpected Error**: {str(e)}"
+
+
+def research_stock(
+    ticker: str,
+    company_name: str,
+    sector: str,
+    market_name: str,
+    current_price: str,
+    api_key: str,
+) -> Generator[str, None, None]:
+    """
+    Streaming generator for the Research tab.
+    Searches the web for news, concalls, SWOT, analyst views, and macro context.
+    """
+    client = OpenAI(api_key=api_key)
+
+    prompt = f"""You are a senior equity research analyst. Conduct deep-dive research on \
+**{company_name}** (ticker: `{ticker}`, exchange: {market_name}, sector: {sector if sector.strip(" -") else "N/A"}, \
+current price: {current_price}).
+
+Search the web thoroughly for the most current information — prioritise sources published in the \
+last 90 days — and produce the following research report:
+
+## 1. Latest News & Developments
+Summarise the 5–8 most significant recent news items (date + source + key takeaway each). \
+Cover corporate actions, regulatory events, product launches, partnerships, legal matters, \
+and any management changes.
+
+## 2. Earnings Calls & Management Commentary
+Summarise the most recent earnings call / investor day / concall:
+- Reported revenue and EPS vs analyst consensus
+- Management guidance for next quarter and full year
+- Key themes and phrases used by management
+- Questions raised by analysts and management responses
+
+## 3. SWOT Analysis
+Provide a structured SWOT:
+- **Strengths** — 3–4 durable competitive advantages
+- **Weaknesses** — 3–4 internal vulnerabilities or gaps
+- **Opportunities** — 3–4 addressable growth vectors
+- **Threats** — 3–4 external risks (competitive, regulatory, macro)
+
+## 4. Analyst Sentiment & Price Targets
+- Current consensus rating (Buy / Hold / Sell split)
+- Range of analyst price targets (low / median / high)
+- Recent rating changes or initiations (last 60 days)
+- Key bull and bear arguments from sell-side research
+
+## 5. Macro & Geopolitical Context
+How is the current global macro environment — including interest rates, inflation, \
+currency trends, trade policy, geopolitical tensions, and sector-specific tailwinds/headwinds — \
+affecting this company's near-term and medium-term outlook? Be specific about which macro \
+factors are most material to this stock.
+
+---
+Be specific, cite figures where available, and flag uncertainty where data is limited. \
+Structure each section with clear headers and bullet points."""
+
+    try:
+        stream = client.responses.create(
+            model="gpt-4o",
+            input=prompt,
+            tools=[{"type": "web_search_preview"}],
+            stream=True,
+        )
+        for event in stream:
+            if getattr(event, "type", None) == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield delta
+
+    except openai.AuthenticationError:
+        yield "\n\n❌ **Authentication Error**: Invalid API key."
+    except openai.RateLimitError:
+        yield "\n\n⚠️ **Rate Limit**: API rate limit reached. Please wait and retry."
+    except openai.APIStatusError as e:
+        yield f"\n\n❌ **API Error ({e.status_code})**: {e.message}"
+    except Exception as e:
+        yield f"\n\n❌ **Unexpected Error**: {str(e)}"

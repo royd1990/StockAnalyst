@@ -5,7 +5,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.analyst import analyze_stock
+from src.advanced_analyst import compute_advanced_metrics, fetch_ownership_data, traffic_light
+from src.analyst import analyze_stock, research_stock
 from src.markets import DEFAULT_MARKETS, MARKETS
 from src.stock_data import (
     get_key_metrics,
@@ -401,8 +402,8 @@ if analyze_btn:
     )
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_fund, tab_ai, tab_charts = st.tabs(
-        ["📊  Fundamentals", "🤖  AI Analysis", "📈  Charts"]
+    tab_fund, tab_ai, tab_adv, tab_research, tab_charts = st.tabs(
+        ["📊  Fundamentals", "🤖  AI Analysis", "🔬  Advanced Fundamental Analysis", "🔍  Research", "📈  Charts"]
     )
 
     key_metrics = get_key_metrics(info, symbol)
@@ -494,7 +495,432 @@ if analyze_btn:
                 )
             )
 
-    # ── Tab 3: Charts ─────────────────────────────────────────────────────────
+    # ── Tab 3: Advanced Analysis ───────────────────────────────────────────────
+    with tab_adv:
+        adv = compute_advanced_metrics(stock_data)
+        sym = symbol  # currency symbol shorthand
+
+        def _fmt(val, as_pct=False, as_currency=False, decimals=2):
+            if val is None:
+                return "—"
+            if as_pct:
+                return f"{val * 100:.{decimals}f}%"
+            if as_currency:
+                from src.stock_data import format_currency
+                return format_currency(val, sym)
+            return f"{val:.{decimals}f}"
+
+        def adv_card(label, value, light=""):
+            st.markdown(
+                f"<div class='metric-card'>"
+                f"<div class='metric-label'>{label}</div>"
+                f"<div class='metric-value'>{light} {value}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        def trend_bar(trend_data, title, color="#00D4AA", value_sym=""):
+            if not trend_data:
+                return None
+            years  = [y for y, _ in trend_data]
+            values = [v / 1e9 for _, v in trend_data]
+            bar_colors = [
+                color if v >= 0 else "#FF6B6B" for v in values
+            ]
+            fig = go.Figure(go.Bar(
+                x=years, y=values,
+                marker_color=bar_colors,
+                text=[f"{v:.2f}B" for v in values],
+                textposition="outside",
+            ))
+            fig.update_layout(
+                title=title,
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=260,
+                showlegend=False,
+                yaxis=dict(title=f"{value_sym}B", gridcolor="rgba(255,255,255,0.05)"),
+                margin=dict(l=0, r=0, t=40, b=0),
+            )
+            return fig
+
+        # ── Section A: Valuation Scorecard ────────────────────────────────────
+        st.markdown('<div class="section-label">📊 Valuation Scorecard</div>', unsafe_allow_html=True)
+        pe_tl  = traffic_light(adv["pe"],  True,  15, 25)
+        pb_tl  = traffic_light(adv["pb"],  True,  1,  3)
+        peg_tl = traffic_light(adv["peg"], True,  1,  2)
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: adv_card("P/E Ratio (TTM)", _fmt(adv["pe"]) + "x", pe_tl)
+        with c2: adv_card("P/B Ratio",       _fmt(adv["pb"]) + "x", pb_tl)
+        with c3: adv_card("PEG Ratio",       _fmt(adv["peg"]) + "x" if adv["peg"] else "—", peg_tl)
+        with c4: adv_card("Forward P/E",     _fmt(adv["forward_pe"]) + "x" if adv["forward_pe"] else "—")
+
+        # Overvalued / undervalued note (will be updated after web search)
+        valuation_placeholder = st.empty()
+
+        st.write("")
+
+        # ── Section B: Balance Sheet Panel ────────────────────────────────────
+        st.markdown('<div class="section-label">📋 Balance Sheet & Income</div>', unsafe_allow_html=True)
+
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            adv_card("Total Revenue",    _fmt(adv["revenue"],    as_currency=True))
+            adv_card("Gross Profit",     _fmt(adv["gross_profit"], as_currency=True))
+        with b2:
+            adv_card("EBIT",             _fmt(adv["ebit"],       as_currency=True))
+            adv_card("EBITDA",           _fmt(adv["ebitda"],     as_currency=True))
+        with b3:
+            adv_card("Net Income",       _fmt(adv["net_income"], as_currency=True))
+            adv_card("Free Cash Flow",   _fmt(adv["fcf"],        as_currency=True))
+        with b4:
+            adv_card("Total Assets",     _fmt(adv["total_assets"],      as_currency=True))
+            adv_card("Total Liabilities",_fmt(adv["total_liabilities"], as_currency=True))
+
+        st.write("")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1: adv_card("Gross Margin",   _fmt(adv["gross_margin"], as_pct=True),
+                           traffic_light(adv["gross_margin"], False, 0.40, 0.20))
+        with m2: adv_card("EBIT Margin",    _fmt(adv["ebit_margin"],  as_pct=True),
+                           traffic_light(adv["ebit_margin"],  False, 0.15, 0.05))
+        with m3: adv_card("Net Margin",     _fmt(adv["net_margin"],   as_pct=True),
+                           traffic_light(adv["net_margin"],   False, 0.10, 0.03))
+        with m4: adv_card("Operating CF",   _fmt(adv["op_cashflow"],  as_currency=True))
+
+        st.write("")
+
+        # ── Section C: Capital, Leverage & Returns ────────────────────────────
+        st.markdown('<div class="section-label">⚖️ Capital, Leverage & Returns</div>', unsafe_allow_html=True)
+
+        cr_tl   = traffic_light(adv["current_ratio"], False, 2.0,  1.0)   # >2 🟢, >1 🟡, <1 🔴
+        de_tl   = traffic_light(adv["de_ratio"],      True,  0.5,  1.5)   # <0.5 🟢, <1.5 🟡, else 🔴
+        ic_tl   = traffic_light(adv["interest_cov"],  False, 5.0,  2.0)   # >5 🟢, >2 🟡, <2 🔴
+        roe_tl  = traffic_light(adv["roe"],           False, 0.15, 0.10)
+        roic_tl = traffic_light(adv["roic"],          False, 0.15, 0.08)
+
+        r1, r2, r3, r4, r5 = st.columns(5)
+        with r1: adv_card("Debt / Equity",      _fmt(adv["de_ratio"])   + "x" if adv["de_ratio"] else "—", de_tl)
+        with r2: adv_card("Current Ratio",      _fmt(adv["current_ratio"]) + "x" if adv["current_ratio"] else "—", cr_tl)
+        with r3: adv_card("Interest Coverage",  _fmt(adv["interest_cov"])  + "x" if adv["interest_cov"]  else "—", ic_tl)
+        with r4: adv_card("ROE",                _fmt(adv["roe"],  as_pct=True), roe_tl)
+        with r5: adv_card("ROIC",               _fmt(adv["roic"], as_pct=True), roic_tl)
+
+        r6, r7, r8, r9, r10 = st.columns(5)
+        with r6: adv_card("ROA",                _fmt(adv["roa"],         as_pct=True))
+        with r7: adv_card("Revenue Growth YoY", _fmt(adv["rev_growth"],  as_pct=True),
+                           traffic_light(adv["rev_growth"], False, 0.15, 0.05))
+        with r8: adv_card("Earnings Growth YoY",_fmt(adv["earn_growth"], as_pct=True),
+                           traffic_light(adv["earn_growth"], False, 0.15, 0.05))
+        with r9: adv_card("EPS (TTM)",          _fmt(adv["eps_ttm"],     as_currency=True))
+        with r10: adv_card("Forward EPS",       _fmt(adv["eps_forward"], as_currency=True),
+                           "🟢" if (adv["eps_forward"] and adv["eps_ttm"]
+                                    and adv["eps_forward"] > adv["eps_ttm"]) else "🔴"
+                           if (adv["eps_forward"] and adv["eps_ttm"]) else "⚪")
+
+        op_lev_val = ("🟢 Yes — earnings growing faster than revenue"
+                      if adv["op_leverage"] is True else
+                      "🔴 No — earnings lagging revenue growth"
+                      if adv["op_leverage"] is False else "⚪ Insufficient data")
+        st.markdown(
+            f"<div class='metric-card'><div class='metric-label'>Operating Leverage</div>"
+            f"<div class='metric-value'>{op_lev_val}</div></div>",
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        # ── Section D: Ownership & Institutional (web search) ─────────────────
+        st.markdown('<div class="section-label">🏦 Ownership & Institutional Activity</div>',
+                    unsafe_allow_html=True)
+
+        ownership = {}
+        if api_key:
+            with st.spinner("Searching the web for ownership and institutional data …"):
+                is_indian = any(x in market_choice.lower() for x in ["india", "nse", "bse"])
+                ownership = fetch_ownership_data(
+                    ticker=full_ticker,
+                    company_name=company_name,
+                    market_name=market_choice,
+                    sector=f"{sector} {industry}".strip(),
+                    api_key=api_key,
+                )
+
+            o1, o2, o3, o4 = st.columns(4)
+            beat_raise = ownership.get("recent_beat_and_raise")
+            beat_tl = "🟢" if beat_raise is True else ("🔴" if beat_raise is False else "⚪")
+
+            inst_trend = ownership.get("institutional_trend", "")
+            inst_tl = {"increasing": "🟢", "decreasing": "🔴", "stable": "🟡"}.get(
+                inst_trend or "", "⚪")
+
+            mf_entering = ownership.get("mf_or_foreign_investment_entering")
+            mf_tl = "🟢" if mf_entering is True else ("🔴" if mf_entering is False else "⚪")
+
+            with o1:
+                if is_indian:
+                    adv_card("Promoter Holdings",
+                             f"{ownership.get('promoter_holdings_pct', '—')}%"
+                             if ownership.get("promoter_holdings_pct") else "—",
+                             traffic_light(ownership.get("promoter_holdings_pct"), False, 50, 30))
+                else:
+                    adv_card("Insider Ownership",
+                             f"{ownership.get('insider_ownership_pct', '—')}%"
+                             if ownership.get("insider_ownership_pct") else "—",
+                             traffic_light(ownership.get("insider_ownership_pct"), False, 10, 5))
+            with o2:
+                if is_indian:
+                    adv_card("Promoter Pledgings",
+                             f"{ownership.get('promoter_pledgings_pct', '—')}%"
+                             if ownership.get("promoter_pledgings_pct") else "—",
+                             traffic_light(ownership.get("promoter_pledgings_pct"), True, 5, 20))
+                else:
+                    adv_card("Industry Avg P/E",
+                             f"{ownership.get('industry_avg_pe', '—')}x"
+                             if ownership.get("industry_avg_pe") else "—")
+            with o3:
+                adv_card("Institutional Trend",
+                         (inst_trend or "Unknown").capitalize(), inst_tl)
+            with o4:
+                adv_card("MF / Foreign Entering",
+                         "Yes" if mf_entering is True else
+                         "No" if mf_entering is False else "Unknown", mf_tl)
+
+            if ownership.get("beat_raise_details"):
+                st.markdown(
+                    f"<div class='metric-card'>"
+                    f"<div class='metric-label'>Most Recent Earnings {beat_tl}</div>"
+                    f"<div class='metric-value' style='font-size:0.95rem;'>"
+                    f"{ownership['beat_raise_details']}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("Enter API key in the sidebar to load ownership and institutional data.")
+
+        st.write("")
+
+        # ── Now update valuation placeholder with intrinsic value ─────────────
+        industry_pe   = ownership.get("industry_avg_pe")
+        intrinsic_val = None
+        if adv["eps_forward"] and industry_pe:
+            intrinsic_val = adv["eps_forward"] * float(industry_pe)
+
+        current_p = adv["current_price"]
+        if intrinsic_val and current_p:
+            diff_pct   = (intrinsic_val - current_p) / current_p * 100
+            verdict    = "🟢 UNDERVALUED" if intrinsic_val > current_p else "🔴 OVERVALUED"
+            valuation_placeholder.markdown(
+                f"<div class='metric-card' style='border-color:rgba(0,212,170,0.4);'>"
+                f"<div class='metric-label'>Intrinsic Value Estimate "
+                f"(Forward EPS × Industry P/E {industry_pe}x)</div>"
+                f"<div class='metric-value'>{sym}{intrinsic_val:.2f} &nbsp; "
+                f"<span style='font-size:0.9rem; color:{'#00D4AA' if diff_pct>0 else '#FF6B6B'}'>"
+                f"{'+' if diff_pct > 0 else ''}{diff_pct:.1f}% vs current {sym}{current_p:.2f}"
+                f"</span> &nbsp; {verdict}</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Section E: Investment Checklist ───────────────────────────────────
+        st.markdown('<div class="section-label">✅ Investment Checklist</div>', unsafe_allow_html=True)
+        st.caption("Based on the Henry Chien fundamental analysis framework")
+
+        def checklist_item(num, label, passed, detail=""):
+            icon   = "✅" if passed is True else ("❌" if passed is False else "❓")
+            bg     = ("rgba(0,212,170,0.08)" if passed is True
+                      else "rgba(255,107,107,0.08)" if passed is False
+                      else "rgba(255,255,255,0.03)")
+            border = ("#00D4AA" if passed is True
+                      else "#FF6B6B" if passed is False
+                      else "rgba(255,255,255,0.08)")
+            st.markdown(
+                f"<div style='background:{bg}; border:1px solid {border}; border-radius:8px;"
+                f" padding:10px 16px; margin-bottom:8px; display:flex; align-items:center; gap:12px;'>"
+                f"<span style='font-size:1.2rem;'>{icon}</span>"
+                f"<div><div style='font-weight:600; font-size:0.9rem;'>{num}. {label}</div>"
+                f"<div style='font-size:0.78rem; color:rgba(255,255,255,0.5); margin-top:2px;'>{detail}</div>"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        checks = []
+
+        # 1. Intrinsic Value > Current Price
+        if intrinsic_val and current_p:
+            checks.append((
+                "Intrinsic Value > Current Price",
+                intrinsic_val > current_p,
+                f"Intrinsic: {sym}{intrinsic_val:.2f}  |  Current: {sym}{current_p:.2f}"
+                f"  (Industry P/E: {industry_pe}x)"
+            ))
+        else:
+            checks.append(("Intrinsic Value > Current Price", None,
+                           "Needs industry P/E from web search — run with API key"))
+
+        # 2. P/E Low (vs industry)
+        pe_val = adv["pe"]
+        if pe_val and industry_pe:
+            checks.append(("P/E Ratio is Low", pe_val < float(industry_pe),
+                           f"Stock P/E: {pe_val:.1f}x  |  Industry avg: {industry_pe}x"))
+        elif pe_val:
+            checks.append(("P/E Ratio is Low", pe_val < 20,
+                           f"P/E: {pe_val:.1f}x (threshold: <20)"))
+        else:
+            checks.append(("P/E Ratio is Low", None, "P/E data unavailable"))
+
+        # 3. P/B Low
+        pb_val = adv["pb"]
+        checks.append(("P/B Ratio is Low",
+                        (pb_val < 3) if pb_val is not None else None,
+                        f"P/B: {pb_val:.2f}x (threshold: <3)" if pb_val else "P/B data unavailable"))
+
+        # 4. D/E Low (industry dependent)
+        de_val = adv["de_ratio"]
+        checks.append(("Debt / Equity is Low",
+                        (de_val < 1.0) if de_val is not None else None,
+                        f"D/E: {de_val:.2f}x (threshold: <1.0)" if de_val else "D/E data unavailable"))
+
+        # 5. Current Ratio > 1 (standard finance)
+        cr_val = adv["current_ratio"]
+        checks.append(("Current Ratio > 1.0",
+                        (cr_val > 1.0) if cr_val is not None else None,
+                        f"Current Ratio: {cr_val:.2f}x" if cr_val else "Data unavailable"))
+
+        # 6. Promoter Pledgings Low  /  Insider Ownership High
+        if is_indian:
+            pledg = ownership.get("promoter_pledgings_pct")
+            checks.append(("Promoter Pledgings Low",
+                           (pledg < 10) if pledg is not None else None,
+                           f"Pledgings: {pledg}%" if pledg is not None else "Data not found via web search"))
+        else:
+            insider = ownership.get("insider_ownership_pct")
+            checks.append(("Insider Ownership > 10%",
+                           (insider > 10) if insider is not None else None,
+                           f"Insider ownership: {insider}%" if insider is not None else "Data not found via web search"))
+
+        # 7. Promoter / Institutional trend increasing
+        if is_indian:
+            ph = ownership.get("promoter_holdings_pct")
+            checks.append(("Promoter Holding Trend Increasing",
+                           None if not ownership else ownership.get("institutional_trend") == "increasing",
+                           f"Holdings: {ph}%" if ph else "See institutional trend field"))
+        else:
+            inst = ownership.get("institutional_trend")
+            checks.append(("Institutional Holding Trend Increasing",
+                           (inst == "increasing") if inst else None,
+                           f"Trend: {inst or 'Unknown'}"))
+
+        # 8. MF / Foreign investment entering
+        mf = ownership.get("mf_or_foreign_investment_entering")
+        checks.append(("MF / Foreign Investors Entering",
+                       mf,
+                       "Based on recent 13F filings and fund flow data" if mf is not None else "Data not found"))
+
+        # 9. Cash flow increasing
+        checks.append(("Operating Cash Flow Increasing",
+                       adv["cashflow_increasing"],
+                       f"Trend: {' → '.join(f'{sym}{v/1e9:.1f}B' for _, v in adv['cashflow_trend'][-3:])}"
+                       if adv["cashflow_trend"] else "Insufficient historical data"))
+
+        # 10. Net Profit & EBITDA growing
+        both_growing = (adv["net_profit_increasing"] and adv["ebitda_increasing"]
+                        if adv["net_profit_increasing"] is not None
+                        and adv["ebitda_increasing"] is not None else None)
+        np_dir  = "↑" if adv["net_profit_increasing"] else ("↓" if adv["net_profit_increasing"] is False else "?")
+        ebd_dir = "↑" if adv["ebitda_increasing"]     else ("↓" if adv["ebitda_increasing"]     is False else "?")
+        checks.append(("Net Profit & EBITDA Growing",
+                       both_growing,
+                       f"Net Profit: {np_dir}  |  EBITDA: {ebd_dir}"))
+
+        passed_count = sum(1 for _, p, _ in checks if p is True)
+        total_scored = sum(1 for _, p, _ in checks if p is not None)
+        score_color  = "#00D4AA" if passed_count >= 7 else ("#FFA500" if passed_count >= 5 else "#FF6B6B")
+        st.markdown(
+            f"<div style='font-size:1.1rem; font-weight:700; margin-bottom:14px; color:{score_color};'>"
+            f"Score: {passed_count} / {total_scored} checks passed"
+            f"{'  🏆 Strong' if passed_count >= 8 else '  👍 Good' if passed_count >= 6 else '  ⚠️ Caution' if passed_count >= 4 else '  🚫 Weak'}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        for i, (label, passed, detail) in enumerate(checks, 1):
+            checklist_item(i, label, passed, detail)
+
+        st.write("")
+
+        # ── Section F: Trend Charts ────────────────────────────────────────────
+        st.markdown('<div class="section-label">📈 Trend Charts</div>', unsafe_allow_html=True)
+
+        chart_pairs = [
+            (adv["revenue_trend"],    "Revenue",          "#00D4AA"),
+            (adv["net_income_trend"], "Net Income",       "#0099FF"),
+            (adv["ebitda_trend"],     "EBITDA",           "#AA66FF"),
+            (adv["cashflow_trend"],   "Operating Cash Flow", "#FFB300"),
+            (adv["fcf_trend"],        "Free Cash Flow",   "#00D4AA"),
+            (adv["eps_trend"],        "EPS",              "#0099FF"),
+        ]
+        # Only render charts that have data; group in rows of 2
+        available = [(t, title, color) for t, title, color in chart_pairs if t]
+        for i in range(0, len(available), 2):
+            pair = available[i: i + 2]
+            cols = st.columns(len(pair))
+            for col, (trend_data, title, color) in zip(cols, pair):
+                with col:
+                    # EPS uses raw values (not billions)
+                    if "EPS" in title:
+                        years  = [y for y, _ in trend_data]
+                        values = [v for _, v in trend_data]
+                        fig = go.Figure(go.Bar(
+                            x=years, y=values,
+                            marker_color=[color if v >= 0 else "#FF6B6B" for v in values],
+                            text=[f"{sym}{v:.2f}" for v in values],
+                            textposition="outside",
+                        ))
+                        fig.update_layout(
+                            title=title, template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                            height=260, showlegend=False,
+                            yaxis=dict(title=sym, gridcolor="rgba(255,255,255,0.05)"),
+                            margin=dict(l=0, r=0, t=40, b=0),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        fig = trend_bar(trend_data, title, color, sym)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tab 4: Research ────────────────────────────────────────────────────────
+    with tab_research:
+        if not api_key:
+            st.warning(
+                "⚠️ **API key required.** "
+                "Set your OpenAI API key in the environment to unlock Research."
+            )
+        else:
+            st.markdown(
+                """<div class="info-banner">
+                🔍 <b>GPT-4o</b> is searching the web for the latest news, earnings calls,
+                analyst opinions, SWOT factors, and macro context. This is a comprehensive
+                research report and typically takes <b>45–90 seconds</b>.
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            sector_str = " — ".join(p for p in [sector, industry] if p) or "N/A"
+            price_str = (
+                f"{symbol}{current_price:,.2f}"
+                if current_price
+                else "N/A"
+            )
+            st.write_stream(
+                research_stock(
+                    ticker=full_ticker,
+                    company_name=company_name,
+                    sector=sector_str,
+                    market_name=market_choice,
+                    current_price=price_str,
+                    api_key=api_key,
+                )
+            )
+
+    # ── Tab 5: Charts ─────────────────────────────────────────────────────────
     with tab_charts:
         history = stock_data.get("history", pd.DataFrame())
         income_stmt = stock_data.get("income_stmt", pd.DataFrame())
