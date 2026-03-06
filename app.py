@@ -421,8 +421,14 @@ if analyze_btn:
         target = info.get("targetMeanPrice")
         num_analysts = info.get("numberOfAnalystOpinions")
         if rec or target:
+            yahoo_ticker = full_ticker.replace(".L", ".L").strip()
+            analyst_url = f"https://finance.yahoo.com/quote/{yahoo_ticker}/analysis/"
             st.markdown(
-                '<div class="section-label">Analyst Consensus</div>',
+                f'<div class="section-label">Analyst Consensus &nbsp;'
+                f'<a href="{analyst_url}" target="_blank" '
+                f'style="font-size:0.75rem; color:#00D4AA; text-decoration:none; '
+                f'font-weight:400; letter-spacing:normal; text-transform:none;">'
+                f'↗ View full analyst breakdown</a></div>',
                 unsafe_allow_html=True,
             )
             c1, c2, c3 = st.columns(3)
@@ -440,7 +446,17 @@ if analyze_btn:
             with c2:
                 metric_card("Mean Target Price", f"{symbol}{target:.2f}" if target else "N/A")
             with c3:
-                metric_card("# Analyst Opinions", str(num_analysts) if num_analysts else "N/A")
+                st.markdown(
+                    f"<div class='metric-card'>"
+                    f"<div class='metric-label'># Analyst Opinions</div>"
+                    f"<div class='metric-value'>"
+                    f"{num_analysts if num_analysts else 'N/A'} &nbsp;"
+                    f"<a href='{analyst_url}' target='_blank' "
+                    f"style='font-size:0.78rem; color:#00D4AA; text-decoration:none;'>↗</a>"
+                    f"</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
     # ── Tab 2: AI Analysis ────────────────────────────────────────────────────
     with tab_ai:
