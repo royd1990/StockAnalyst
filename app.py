@@ -236,17 +236,11 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        placeholder="sk-...",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        help="Get yours at platform.openai.com",
-    )
+    api_key = os.getenv("OPENAI_API_KEY", "")
     if api_key:
-        st.success("✅ API key configured", icon="🔑")
+        st.success("✅ AI analysis ready", icon="🔑")
     else:
-        st.warning("Enter API key to enable AI analysis")
+        st.error("OPENAI_API_KEY not set in environment")
 
     st.divider()
 
