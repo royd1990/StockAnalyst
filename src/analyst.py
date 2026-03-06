@@ -74,13 +74,17 @@ End with a one-paragraph **Investment Summary** suitable for a client briefing n
 Be data-driven, specific, and actionable. Use numbers wherever possible."""
 
     try:
-        with client.responses.stream(
+        stream = client.responses.create(
             model="gpt-4o",
             input=prompt,
             tools=[{"type": "web_search_preview"}],
-        ) as stream:
-            for text in stream.text_stream:
-                yield text
+            stream=True,
+        )
+        for event in stream:
+            if getattr(event, "type", None) == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield delta
 
     except openai.AuthenticationError:
         yield "\n\n❌ **Authentication Error**: Invalid API key. Please check your OpenAI API key in the sidebar."
