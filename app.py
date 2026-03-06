@@ -238,6 +238,7 @@ with st.sidebar:
 
     api_key = st.text_input(
         "OpenAI API Key",
+        type="password",
         placeholder="sk-...",
         value=os.getenv("OPENAI_API_KEY", ""),
         help="Get yours at platform.openai.com",
