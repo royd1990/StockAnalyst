@@ -6,7 +6,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.advanced_analyst import compute_advanced_metrics, fetch_ownership_data, traffic_light
-from src.analyst import analyze_stock, research_stock
+from src.analyst import analyze_portfolio, analyze_stock, research_stock
 from src.markets import DEFAULT_MARKETS, MARKETS
 from src.screener import get_universe_for_markets, screen_stocks
 from src.stock_data import (
@@ -231,6 +231,425 @@ def create_financials_chart(income_stmt: pd.DataFrame, symbol: str) -> "go.Figur
     return fig
 
 
+# ── Portfolio renderer ────────────────────────────────────────────────────────
+
+_CURRENCY_SYMBOLS = {
+    "USD": "$", "GBP": "£", "EUR": "€", "INR": "₹", "JPY": "¥",
+    "HKD": "HK$", "AUD": "A$", "CAD": "C$", "BRL": "R$",
+    "SGD": "S$", "CHF": "CHF ", "KRW": "₩", "ZAR": "R",
+}
+
+
+def _portfolio_checklist(adv: dict) -> tuple:
+    """Return (passed, total, checks) using only locally-computable conditions."""
+    checks = []
+
+    pe = adv.get("pe")
+    checks.append(("P/E < 20", (pe < 20) if pe is not None else None,
+                   f"P/E: {pe:.1f}x" if pe is not None else "N/A"))
+
+    pb = adv.get("pb")
+    checks.append(("P/B < 3", (pb < 3) if pb is not None else None,
+                   f"P/B: {pb:.2f}x" if pb is not None else "N/A"))
+
+    de = adv.get("de_ratio")
+    checks.append(("D/E < 1", (de < 1.0) if de is not None else None,
+                   f"D/E: {de:.2f}x" if de is not None else "N/A"))
+
+    cr = adv.get("current_ratio")
+    checks.append(("Current Ratio > 1", (cr > 1.0) if cr is not None else None,
+                   f"CR: {cr:.2f}x" if cr is not None else "N/A"))
+
+    rev_g = adv.get("rev_growth")
+    checks.append(("Revenue Growing", (rev_g > 0) if rev_g is not None else None,
+                   f"{rev_g * 100:.1f}% YoY" if rev_g is not None else "N/A"))
+
+    roe = adv.get("roe")
+    checks.append(("ROE > 15%", (roe > 0.15) if roe is not None else None,
+                   f"ROE: {roe * 100:.1f}%" if roe is not None else "N/A"))
+
+    both_growing = (
+        adv.get("net_profit_increasing") and adv.get("ebitda_increasing")
+        if adv.get("net_profit_increasing") is not None and adv.get("ebitda_increasing") is not None
+        else None
+    )
+    checks.append(("Profit & EBITDA Growing", both_growing,
+                   f"NP: {'↑' if adv.get('net_profit_increasing') else '↓' if adv.get('net_profit_increasing') is False else '?'}  "
+                   f"EBITDA: {'↑' if adv.get('ebitda_increasing') else '↓' if adv.get('ebitda_increasing') is False else '?'}"))
+
+    checks.append(("Op. Cash Flow Increasing", adv.get("cashflow_increasing"),
+                   "Based on last 3 years"))
+
+    passed = sum(1 for _, p, _ in checks if p is True)
+    total = sum(1 for _, p, _ in checks if p is not None)
+    return passed, total, checks
+
+
+def _render_portfolio(api_key: str) -> None:
+    st.markdown(
+        "<div class='section-label' style='font-size:1.3rem;'>📁 Portfolio Analysis</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Stock builder ──────────────────────────────────────────────────────────
+    st.markdown("#### Build Your Portfolio")
+    st.caption("Add stocks one at a time from any market. Up to 15 stocks.")
+
+    if "ptf_list" not in st.session_state:
+        st.session_state["ptf_list"] = []  # list of (full_ticker, market_name, display_name)
+
+    col_t, col_m, col_add = st.columns([2, 2, 1])
+    with col_t:
+        new_ticker = st.text_input(
+            "Ticker", placeholder="e.g. AAPL, RELIANCE, SAP …",
+            key="ptf_ticker_input", label_visibility="collapsed",
+        )
+    with col_m:
+        new_market = st.selectbox(
+            "Market", options=list(MARKETS.keys()),
+            key="ptf_market_input", label_visibility="collapsed",
+        )
+    with col_add:
+        add_btn = st.button("＋ Add Stock", use_container_width=True)
+
+    if new_market:
+        minfo = MARKETS[new_market]
+        suffix_display = f"`{minfo['suffix']}`" if minfo["suffix"] else "*(no suffix)*"
+        st.caption(
+            f"**{minfo['description']}** — suffix {suffix_display} added automatically.  "
+            f"Examples: `{'`, `'.join(minfo['examples'][:3])}`"
+        )
+
+    if add_btn and new_ticker.strip():
+        minfo = MARKETS[new_market]
+        full_ticker = new_ticker.strip().upper() + minfo["suffix"]
+        existing = [ft for ft, _, _ in st.session_state["ptf_list"]]
+        if len(existing) >= 15:
+            st.warning("Maximum 15 stocks reached.")
+        elif full_ticker in existing:
+            st.warning(f"{full_ticker} is already in the portfolio.")
+        else:
+            st.session_state["ptf_list"].append(
+                (full_ticker, new_market, new_ticker.strip().upper())
+            )
+            st.rerun()
+
+    # Current portfolio list
+    if st.session_state["ptf_list"]:
+        st.markdown("**Current portfolio:**")
+        items = st.session_state["ptf_list"]
+        cols_per_row = 5
+        for row_start in range(0, len(items), cols_per_row):
+            row_items = items[row_start: row_start + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for j, (full_t, mkt, _) in enumerate(row_items):
+                with cols[j]:
+                    st.markdown(
+                        f"<div class='metric-card' style='text-align:center; padding:10px;'>"
+                        f"<div style='font-weight:700; font-size:0.95rem;'>{full_t}</div>"
+                        f"<div style='font-size:0.72rem; color:#00D4AA; margin-top:2px;'>{mkt}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("✕ Remove", key=f"rm_{full_t}", use_container_width=True):
+                        st.session_state["ptf_list"] = [
+                            x for x in st.session_state["ptf_list"] if x[0] != full_t
+                        ]
+                        st.session_state.pop("portfolio_stocks", None)
+                        st.rerun()
+
+        st.write("")
+        col_load, col_clear = st.columns([3, 1])
+        with col_load:
+            load_btn = st.button("▶  Load Portfolio Data", type="primary", use_container_width=True)
+        with col_clear:
+            if st.button("🗑 Clear All", use_container_width=True):
+                st.session_state["ptf_list"] = []
+                st.session_state.pop("portfolio_stocks", None)
+                st.rerun()
+    else:
+        st.info("Add at least one stock above to get started.")
+        load_btn = False
+
+    # ── Fetch data ─────────────────────────────────────────────────────────────
+    if load_btn:
+        tickers_to_fetch = [ft for ft, _, _ in st.session_state["ptf_list"]]
+        portfolio_stocks = []
+        failed = []
+        prog = st.progress(0.0)
+        prog_txt = st.empty()
+
+        for i, (full_ticker, market_name, _) in enumerate(st.session_state["ptf_list"]):
+            prog_txt.caption(f"Fetching {full_ticker} ({i + 1}/{len(tickers_to_fetch)})…")
+            data = get_stock_data(full_ticker)
+            prog.progress((i + 1) / len(tickers_to_fetch))
+            if not data:
+                failed.append(full_ticker)
+                continue
+
+            info = data["info"]
+            adv = compute_advanced_metrics(data)
+            sym = _CURRENCY_SYMBOLS.get(info.get("currency", "USD"), "$")
+
+            company_name = info.get("longName") or info.get("shortName") or full_ticker
+            sector   = info.get("sector", "")
+            industry = info.get("industry", "")
+            country  = info.get("country", "")
+
+            current_price = (
+                info.get("currentPrice")
+                or info.get("regularMarketPrice")
+                or info.get("previousClose")
+                or 0.0
+            )
+            prev_close  = info.get("previousClose") or info.get("regularMarketPreviousClose") or current_price
+            price_change = current_price - prev_close
+            pct_change   = (price_change / prev_close * 100) if prev_close else 0.0
+
+            rec          = (info.get("recommendationKey") or "").upper().replace("_", " ")
+            target_mean  = info.get("targetMeanPrice")
+            target_high  = info.get("targetHighPrice")
+            target_low   = info.get("targetLowPrice")
+            num_analysts = info.get("numberOfAnalystOpinions") or 0
+            upside_pct   = ((target_mean - current_price) / current_price * 100) if target_mean and current_price else None
+
+            passed, total, checks = _portfolio_checklist(adv)
+
+            parts = []
+            if adv.get("pe"):   parts.append(f"P/E {adv['pe']:.1f}x")
+            if adv.get("pb"):   parts.append(f"P/B {adv['pb']:.2f}x")
+            if adv.get("roe"):  parts.append(f"ROE {adv['roe']*100:.1f}%")
+            if adv.get("de_ratio"): parts.append(f"D/E {adv['de_ratio']:.2f}x")
+            if adv.get("rev_growth"): parts.append(f"RevGr {adv['rev_growth']*100:.1f}%")
+            metrics_summary = " | ".join(parts)
+
+            portfolio_stocks.append({
+                "ticker":        full_ticker,
+                "company_name":  company_name,
+                "sector":        f"{sector} — {industry}".strip(" —") or "N/A",
+                "country":       country or "N/A",
+                "market_name":   market_name,
+                "sym":           sym,
+                "current_price_raw": current_price,
+                "current_price": f"{sym}{current_price:,.2f}",
+                "price_change":  price_change,
+                "pct_change":    pct_change,
+                "rec":           rec or "N/A",
+                "target_mean":   target_mean,
+                "target_price":  f"{sym}{target_mean:.2f}" if target_mean else "N/A",
+                "target_high":   f"{sym}{target_high:.2f}" if target_high else "N/A",
+                "target_low":    f"{sym}{target_low:.2f}"  if target_low  else "N/A",
+                "upside_pct":    upside_pct,
+                "num_analysts":  num_analysts,
+                "passed":        passed,
+                "total":         total,
+                "checks":        checks,
+                "metrics_summary": metrics_summary,
+            })
+
+        prog.empty()
+        prog_txt.empty()
+
+        if failed:
+            st.warning(f"Could not fetch data for: {', '.join(failed)}")
+        if not portfolio_stocks:
+            st.error("No valid stock data found. Check the ticker symbols.")
+            return
+
+        st.session_state["portfolio_stocks"] = portfolio_stocks
+
+    stocks = st.session_state.get("portfolio_stocks", [])
+    if not stocks:
+        return
+
+    st.divider()
+
+    # ── Summary Table ──────────────────────────────────────────────────────────
+    st.markdown('<div class="section-label">Portfolio Summary</div>', unsafe_allow_html=True)
+
+    summary_rows = []
+    for s in stocks:
+        upside_str = f"{s['upside_pct']:+.1f}%" if s["upside_pct"] is not None else "N/A"
+        score_emoji = "🟢" if s["passed"] >= 6 else "🟡" if s["passed"] >= 4 else "🔴"
+        rec_emoji   = {"BUY": "🟢", "STRONG BUY": "🟢", "HOLD": "🟡",
+                       "UNDERPERFORM": "🔴", "SELL": "🔴"}.get(s["rec"], "⚪")
+        summary_rows.append({
+            "Ticker":        s["ticker"],
+            "Company":       s["company_name"],
+            "Country":       s["country"],
+            "Price":         s["current_price"],
+            "Day Chg":       f"{'+' if s['price_change'] >= 0 else ''}{s['pct_change']:.2f}%",
+            "Analyst":       f"{rec_emoji} {s['rec']}",
+            "Target Low":    s["target_low"],
+            "Target Mean":   s["target_price"],
+            "Target High":   s["target_high"],
+            "Upside":        upside_str,
+            "# Analysts":    s["num_analysts"] or "N/A",
+            "Fund. Score":   f"{score_emoji} {s['passed']}/{s['total']}",
+        })
+
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    st.write("")
+
+    # ── Per-Stock Detail Cards ─────────────────────────────────────────────────
+    st.markdown(
+        '<div class="section-label">Analyst Targets & Fundamental Conditions</div>',
+        unsafe_allow_html=True,
+    )
+
+    for s in stocks:
+        rec_color = {"BUY": "#00D4AA", "STRONG BUY": "#00D4AA", "HOLD": "#FFA500",
+                     "UNDERPERFORM": "#FF6B6B", "SELL": "#FF6B6B"}.get(s["rec"], "#aaa")
+        upside_str   = f"{s['upside_pct']:+.1f}%" if s["upside_pct"] is not None else "N/A"
+        upside_color = "#00D4AA" if (s["upside_pct"] or 0) >= 0 else "#FF6B6B"
+        score_color  = "#00D4AA" if s["passed"] >= 6 else "#FFA500" if s["passed"] >= 4 else "#FF6B6B"
+
+        with st.expander(
+            f"**{s['ticker']}** — {s['company_name']}  ·  {s['current_price']}"
+            f"  ·  {s['rec']}  ·  Target {s['target_price']}  ·  Score {s['passed']}/{s['total']}"
+        ):
+            # ── Analyst targets ────────────────────────────────────────────────
+            st.markdown('<div class="section-label">Analyst Price Targets</div>', unsafe_allow_html=True)
+            tc1, tc2, tc3, tc4, tc5, tc6 = st.columns(6)
+            with tc1:
+                st.markdown(
+                    f"<div class='metric-card'><div class='metric-label'>Consensus</div>"
+                    f"<div class='metric-value' style='color:{rec_color}'>{s['rec']}</div></div>",
+                    unsafe_allow_html=True,
+                )
+            with tc2:
+                metric_card("# Analysts", str(s["num_analysts"]) if s["num_analysts"] else "N/A")
+            with tc3:
+                metric_card("Target Low", s["target_low"])
+            with tc4:
+                metric_card("Target Mean", s["target_price"])
+            with tc5:
+                metric_card("Target High", s["target_high"])
+            with tc6:
+                st.markdown(
+                    f"<div class='metric-card'><div class='metric-label'>Upside (Mean)</div>"
+                    f"<div class='metric-value' style='color:{upside_color}'>{upside_str}</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+            # Visual target range bar
+            if s["target_low"] != "N/A" and s["target_high"] != "N/A" and s["current_price_raw"]:
+                tlo = s.get("target_mean", 0) * 0.85 if not isinstance(s["target_low"], str) else 0
+                # Use raw numeric values for the bar
+                try:
+                    tlo_raw  = float(s["target_low"].replace(s["sym"], "").replace(",", ""))
+                    thi_raw  = float(s["target_high"].replace(s["sym"], "").replace(",", ""))
+                    tmn_raw  = float(s["target_price"].replace(s["sym"], "").replace(",", ""))
+                    cur_raw  = s["current_price_raw"]
+                    bar_min  = min(tlo_raw, cur_raw) * 0.97
+                    bar_max  = max(thi_raw, cur_raw) * 1.03
+                    bar_span = bar_max - bar_min
+
+                    def _bar_pct(v):
+                        return max(0, min(100, (v - bar_min) / bar_span * 100))
+
+                    cur_pct = _bar_pct(cur_raw)
+                    lo_pct  = _bar_pct(tlo_raw)
+                    mn_pct  = _bar_pct(tmn_raw)
+                    hi_pct  = _bar_pct(thi_raw)
+
+                    st.markdown(
+                        f"""<div style='margin:14px 0 6px; padding:0 8px;'>
+                        <div style='position:relative; height:10px; background:rgba(255,255,255,0.08); border-radius:6px;'>
+                            <div style='position:absolute; left:{lo_pct:.1f}%; width:{hi_pct-lo_pct:.1f}%;
+                                height:100%; background:rgba(0,212,170,0.25); border-radius:6px;'></div>
+                            <div title="Mean Target" style='position:absolute; left:{mn_pct:.1f}%;
+                                transform:translateX(-50%); width:3px; height:100%; background:#00D4AA;'></div>
+                            <div title="Current Price" style='position:absolute; left:{cur_pct:.1f}%;
+                                transform:translateX(-50%); width:10px; height:16px; top:-3px;
+                                background:#fff; border-radius:3px;'></div>
+                        </div>
+                        <div style='display:flex; justify-content:space-between;
+                            font-size:0.72rem; color:rgba(255,255,255,0.45); margin-top:5px;'>
+                            <span>Low {s['target_low']}</span>
+                            <span style='color:#aaa;'>● Current {s['current_price']}</span>
+                            <span style='color:#00D4AA;'>│ Mean {s['target_price']}</span>
+                            <span>High {s['target_high']}</span>
+                        </div></div>""",
+                        unsafe_allow_html=True,
+                    )
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+            st.write("")
+
+            # ── Fundamental checklist ──────────────────────────────────────────
+            st.markdown('<div class="section-label">Fundamental Conditions</div>', unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='font-size:1rem; font-weight:700; color:{score_color}; margin-bottom:10px;'>"
+                f"Score: {s['passed']}/{s['total']} — "
+                f"{'🏆 Strong' if s['passed'] >= 7 else '👍 Good' if s['passed'] >= 5 else '⚠️ Caution' if s['passed'] >= 3 else '🚫 Weak'}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            check_cols = st.columns(2)
+            for idx, (label, passed, detail) in enumerate(s["checks"]):
+                icon   = "✅" if passed is True else "❌" if passed is False else "❓"
+                bg     = ("rgba(0,212,170,0.08)" if passed is True
+                          else "rgba(255,107,107,0.08)" if passed is False
+                          else "rgba(255,255,255,0.03)")
+                border = ("#00D4AA" if passed is True
+                          else "#FF6B6B" if passed is False
+                          else "rgba(255,255,255,0.08)")
+                with check_cols[idx % 2]:
+                    st.markdown(
+                        f"<div style='background:{bg}; border:1px solid {border}; border-radius:8px;"
+                        f" padding:8px 14px; margin-bottom:8px;'>"
+                        f"<span style='font-size:1rem;'>{icon}</span>"
+                        f" <span style='font-weight:600; font-size:0.88rem;'>{label}</span>"
+                        f"<div style='font-size:0.75rem; color:rgba(255,255,255,0.5); margin-top:2px;'>{detail}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+    st.write("")
+
+    # ── AI Portfolio Analysis ──────────────────────────────────────────────────
+    st.markdown('<div class="section-label">🤖 AI Portfolio Analysis</div>', unsafe_allow_html=True)
+
+    if not api_key:
+        st.info("Enter your API key in the sidebar to enable AI-powered portfolio analysis.")
+        return
+
+    st.markdown(
+        """<div class="info-banner">
+        🤖 <b>GPT-4o</b> searches the web for the latest news and analyst views on every stock,
+        then delivers a full portfolio report — per-stock verdicts with <b>AI price targets</b>,
+        diversification review, and prioritised actions.
+        Typically takes <b>45–90 seconds</b>.
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("▶  Run AI Portfolio Analysis", type="primary"):
+        ai_payload = [
+            {
+                "ticker":          s["ticker"],
+                "company_name":    s["company_name"],
+                "sector":          s["sector"],
+                "country":         s["country"],
+                "market_name":     s["market_name"],
+                "current_price":   s["current_price"],
+                "target_low":      s["target_low"],
+                "target_price":    s["target_price"],
+                "target_high":     s["target_high"],
+                "upside_pct":      s["upside_pct"],
+                "analyst_rec":     s["rec"],
+                "analyst_count":   s["num_analysts"] or "N/A",
+                "metrics_summary": s["metrics_summary"],
+                "checklist_score": f"{s['passed']}/{s['total']}",
+            }
+            for s in stocks
+        ]
+        st.write_stream(analyze_portfolio(ai_payload, api_key))
+
+
 # ── Screener renderer ─────────────────────────────────────────────────────────
 
 def _render_screener(selected_markets: list, api_key: str) -> None:
@@ -382,9 +801,9 @@ with st.sidebar:
 
     page_mode = st.radio(
         "Mode",
-        ["📊 Stock Analysis", "🔎 Stock Screener"],
+        ["📊 Stock Analysis", "🔎 Stock Screener", "📁 Portfolio Analysis"],
         label_visibility="collapsed",
-        horizontal=True,
+        horizontal=False,
     )
 
     st.divider()
@@ -449,9 +868,13 @@ st.markdown(
 
 st.write("")
 
-# ── Screener page (short-circuits the rest when active) ───────────────────────
+# ── Screener / Portfolio pages (short-circuit when active) ────────────────────
 if page_mode == "🔎 Stock Screener":
     _render_screener(selected_markets, api_key)
+    st.stop()
+
+if page_mode == "📁 Portfolio Analysis":
+    _render_portfolio(api_key)
     st.stop()
 
 # ── Search bar ────────────────────────────────────────────────────────────────

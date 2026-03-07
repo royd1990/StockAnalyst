@@ -173,3 +173,97 @@ Structure each section with clear headers and bullet points."""
         yield f"\n\n❌ **API Error ({e.status_code})**: {e.message}"
     except Exception as e:
         yield f"\n\n❌ **Unexpected Error**: {str(e)}"
+
+
+def analyze_portfolio(stocks: list, api_key: str) -> Generator[str, None, None]:
+    """
+    Streaming generator for portfolio-level AI analysis.
+    stocks: list of dicts with ticker, company_name, sector, market_name,
+            current_price, target_price, target_low, target_high, upside_pct,
+            analyst_rec, analyst_count, metrics_summary, checklist_score.
+    """
+    client = OpenAI(api_key=api_key)
+
+    stock_blocks = []
+    for i, s in enumerate(stocks, 1):
+        upside = f"{s['upside_pct']:+.1f}%" if s.get("upside_pct") is not None else "N/A"
+        stock_blocks.append(
+            f"**{i}. {s['company_name']} ({s['ticker']})** — {s['market_name']} | {s.get('country', 'N/A')}\n"
+            f"   Sector: {s['sector']}\n"
+            f"   Current Price: {s['current_price']} | Analyst Consensus: {s['analyst_rec']} | "
+            f"Analyst Targets: Low {s['target_low']} / Mean {s['target_price']} / High {s['target_high']} | "
+            f"Upside to Mean: {upside} | # Analysts: {s['analyst_count']}\n"
+            f"   Key Metrics: {s['metrics_summary']}\n"
+            f"   Fundamental Score: {s['checklist_score']}"
+        )
+
+    portfolio_block = "\n\n".join(stock_blocks)
+    tickers_list = ", ".join(s["ticker"] for s in stocks)
+
+    prompt = f"""You are a senior portfolio manager and equity analyst. \
+Analyze the following portfolio of {len(stocks)} stocks from potentially multiple countries and markets.
+
+**Portfolio Holdings:**
+{portfolio_block}
+
+Search the web for the latest news, earnings results, and analyst updates for each of these tickers: {tickers_list}.
+
+Structure your analysis as follows:
+
+## 1. Portfolio Overview
+- Sector distribution and geographic/country diversification breakdown
+- Overall fundamental quality summary (reference checklist scores)
+- Portfolio risk profile: Aggressive / Balanced / Defensive — and why
+- Any notable cross-market or currency risks
+
+## 2. Per-Stock Analysis
+For **each** stock in the portfolio, provide a dedicated subsection:
+
+### [Ticker] — [Company Name]
+- **Latest News & Catalyst** (from web search — cite date and source)
+- **Analyst Target Assessment** — do the analyst low/mean/high targets look credible? Why or why not?
+- **AI Price Target (12-month)**: Provide your own independent price target with three scenarios:
+  - Bear case target & rationale
+  - Base case target & rationale
+  - Bull case target & rationale
+- **Verdict**: STRONG BUY / BUY / HOLD / REDUCE / SELL
+- **Conviction**: High / Medium / Low
+- **Key Risk** to the position
+
+## 3. Portfolio Strengths & Concerns
+- What is working well across the portfolio?
+- Concentration risks, correlation risks, or sector/country overweights?
+- Any positions where fundamentals have visibly deteriorated recently?
+
+## 4. Suggested Actions (Priority Order)
+- **ADD / BUY MORE**: positions and reasoning (with price levels if applicable)
+- **HOLD**: fairly valued positions
+- **REDUCE / EXIT**: positions and reasoning
+Include valuation or price target reasoning for each recommendation.
+
+## 5. Portfolio Scorecard
+A summary table with columns: Stock | Verdict | AI Base Target | Analyst Mean Target | Conviction | Action
+
+Be specific, use numbers, cite recent data from web search. Clearly note where data is limited."""
+
+    try:
+        stream = client.responses.create(
+            model="gpt-4o",
+            input=prompt,
+            tools=[{"type": "web_search_preview"}],
+            stream=True,
+        )
+        for event in stream:
+            if getattr(event, "type", None) == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield delta
+
+    except openai.AuthenticationError:
+        yield "\n\n❌ **Authentication Error**: Invalid API key."
+    except openai.RateLimitError:
+        yield "\n\n⚠️ **Rate Limit**: API rate limit reached. Please wait and retry."
+    except openai.APIStatusError as e:
+        yield f"\n\n❌ **API Error ({e.status_code})**: {e.message}"
+    except Exception as e:
+        yield f"\n\n❌ **Unexpected Error**: {str(e)}"
