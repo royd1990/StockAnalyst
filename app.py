@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from src.advanced_analyst import compute_advanced_metrics, fetch_ownership_data, traffic_light
 from src.analyst import analyze_stock, research_stock
 from src.markets import DEFAULT_MARKETS, MARKETS
+from src.screener import get_universe_for_markets, screen_stocks
 from src.stock_data import (
     get_key_metrics,
     get_stock_data,
@@ -230,12 +231,163 @@ def create_financials_chart(income_stmt: pd.DataFrame, symbol: str) -> "go.Figur
     return fig
 
 
+# ── Screener renderer ─────────────────────────────────────────────────────────
+
+def _render_screener(selected_markets: list, api_key: str) -> None:
+    from src.markets import MARKETS as _MARKETS
+
+    st.markdown(
+        "<div class='section-label' style='font-size:1.3rem;'>🔎 Stock Screener</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Select markets and adjust the filter sliders below, then click **Run Screener**. "
+        "Only stocks that meet ALL active filters are shown."
+    )
+
+    # ── Market selector ───────────────────────────────────────────────────────
+    market_codes = [_MARKETS[m]["code"] for m in selected_markets if m in _MARKETS]
+
+    # ── Filter sliders ────────────────────────────────────────────────────────
+    col_left, col_right = st.columns([1, 3])
+
+    with col_left:
+        st.markdown("##### Valuation")
+        pe_max     = st.slider("P/E (TTM) max",       0.0, 100.0, 40.0, 0.5)
+        fpe_max    = st.slider("Forward P/E max",      0.0, 100.0, 35.0, 0.5)
+        pb_max     = st.slider("P/B max",              0.0,  20.0,  5.0, 0.1)
+        peg_max    = st.slider("PEG max",              0.0,   5.0,  2.0, 0.1)
+
+        st.markdown("##### Profitability")
+        roe_min    = st.slider("ROE % min",          -20.0,  60.0,  0.0, 0.5)
+        roa_min    = st.slider("ROA % min",          -10.0,  30.0,  0.0, 0.5)
+        nm_min     = st.slider("Net Margin % min",   -20.0,  50.0,  0.0, 0.5)
+        gm_min     = st.slider("Gross Margin % min",   0.0, 100.0,  0.0, 1.0)
+
+        st.markdown("##### Growth")
+        rev_g_min  = st.slider("Rev Growth % min",   -20.0,  80.0,  0.0, 1.0)
+        earn_g_min = st.slider("Earn Growth % min",  -50.0, 150.0,  0.0, 1.0)
+
+        st.markdown("##### Financial Health")
+        de_max     = st.slider("Debt/Equity max",      0.0,  10.0,  3.0, 0.1)
+        cr_min     = st.slider("Current Ratio min",    0.0,   5.0,  0.0, 0.1)
+
+        st.markdown("##### Dividend")
+        div_min    = st.slider("Div Yield % min",      0.0,  15.0,  0.0, 0.1)
+
+        run_btn = st.button("▶  Run Screener", type="primary", use_container_width=True)
+
+    with col_right:
+        if not run_btn:
+            universe = get_universe_for_markets(market_codes)
+            st.info(
+                f"Universe: **{len(universe)} stocks** across "
+                f"**{len(market_codes)} markets**. "
+                "Adjust sliders and click **Run Screener** to start."
+            )
+            return
+
+        universe = get_universe_for_markets(market_codes)
+        if not universe:
+            st.warning("No stocks found for the selected markets. Select at least one market in the sidebar.")
+            return
+
+        total = len(universe)
+        st.markdown(f"Screening **{total} stocks** — this may take 1–3 minutes…")
+        prog_bar  = st.progress(0.0)
+        prog_text = st.empty()
+
+        def _on_progress(done: int, t: int):
+            prog_bar.progress(done / t)
+            prog_text.caption(f"{done} / {t} tickers fetched…")
+
+        filters = {
+            "P/E (TTM)":     (None,    pe_max),
+            "Fwd P/E":       (None,    fpe_max),
+            "P/B":           (None,    pb_max),
+            "PEG":           (None,    peg_max),
+            "ROE %":         (roe_min,  None),
+            "ROA %":         (roa_min,  None),
+            "Net Margin %":  (nm_min,   None),
+            "Gross Margin %":(gm_min,   None),
+            "Rev Growth %":  (rev_g_min, None),
+            "Earn Growth %": (earn_g_min, None),
+            "D/E":           (None,    de_max),
+            "Current Ratio": (cr_min,   None),
+            "Div Yield %":   (div_min,  None),
+        }
+
+        with st.spinner(""):
+            result_df = screen_stocks(
+                universe, filters, max_workers=25, progress_cb=_on_progress
+            )
+
+        prog_bar.empty()
+        prog_text.empty()
+
+        if result_df.empty:
+            st.warning("No stocks matched your filters. Try relaxing some criteria.")
+            return
+
+        st.success(f"✅ **{len(result_df)} stocks** matched your filters.")
+
+        # Display columns (drop internal _price)
+        display_cols = [
+            "Ticker", "Name", "Sector", "Market Cap (B)",
+            "P/E (TTM)", "Fwd P/E", "P/B", "PEG",
+            "ROE %", "ROA %", "Net Margin %", "Gross Margin %",
+            "Rev Growth %", "Earn Growth %",
+            "D/E", "Current Ratio", "Div Yield %",
+        ]
+        display_cols = [c for c in display_cols if c in result_df.columns]
+        df_show = result_df[display_cols].copy()
+
+        # Round numeric columns for readability
+        for col in df_show.select_dtypes("float").columns:
+            df_show[col] = df_show[col].round(2)
+
+        st.dataframe(
+            df_show,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Market Cap (B)": st.column_config.NumberColumn(format="%.2f B"),
+                "P/E (TTM)":      st.column_config.NumberColumn(format="%.1f x"),
+                "Fwd P/E":        st.column_config.NumberColumn(format="%.1f x"),
+                "P/B":            st.column_config.NumberColumn(format="%.2f x"),
+                "PEG":            st.column_config.NumberColumn(format="%.2f"),
+                "ROE %":          st.column_config.NumberColumn(format="%.1f %%"),
+                "ROA %":          st.column_config.NumberColumn(format="%.1f %%"),
+                "Net Margin %":   st.column_config.NumberColumn(format="%.1f %%"),
+                "Gross Margin %": st.column_config.NumberColumn(format="%.1f %%"),
+                "Rev Growth %":   st.column_config.NumberColumn(format="%.1f %%"),
+                "Earn Growth %":  st.column_config.NumberColumn(format="%.1f %%"),
+                "D/E":            st.column_config.NumberColumn(format="%.2f"),
+                "Current Ratio":  st.column_config.NumberColumn(format="%.2f"),
+                "Div Yield %":    st.column_config.NumberColumn(format="%.2f %%"),
+            },
+        )
+        st.caption(
+            "Click any column header to sort. "
+            "To analyse a stock, copy its ticker and switch to 📊 Stock Analysis mode."
+        )
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(
         "<h2 style='margin-bottom:4px;'>⚙️ Configuration</h2>",
         unsafe_allow_html=True,
     )
+
+    page_mode = st.radio(
+        "Mode",
+        ["📊 Stock Analysis", "🔎 Stock Screener"],
+        label_visibility="collapsed",
+        horizontal=True,
+    )
+
+    st.divider()
 
     api_key = os.getenv("OPENAI_API_KEY", "")
     if api_key:
@@ -296,6 +448,11 @@ st.markdown(
 )
 
 st.write("")
+
+# ── Screener page (short-circuits the rest when active) ───────────────────────
+if page_mode == "🔎 Stock Screener":
+    _render_screener(selected_markets, api_key)
+    st.stop()
 
 # ── Search bar ────────────────────────────────────────────────────────────────
 col_ticker, col_market, col_btn = st.columns([3, 3, 1])
