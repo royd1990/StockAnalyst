@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from src.advanced_analyst import compute_advanced_metrics, fetch_ownership_data, traffic_light
 from src.analyst import analyze_portfolio, analyze_stock, research_stock
 from src.markets import DEFAULT_MARKETS, MARKETS
-from src.screener import get_universe_for_markets, screen_stocks
+from src.screener import UNIVERSES, get_universe_for_markets, screen_stocks
+from src.strategy_52w import run_52w_high_strategy
 from src.stock_data import (
     get_key_metrics,
     get_stock_data,
@@ -792,6 +793,176 @@ def _render_screener(selected_markets: list, api_key: str) -> None:
         )
 
 
+# ── Technical Strategy renderer ───────────────────────────────────────────────
+
+def _render_technical_strategy() -> None:
+    from src.markets import MARKETS as _MARKETS
+
+    st.markdown(
+        "<div class='section-label' style='font-size:1.3rem;'>📐 Technical Strategy</div>",
+        unsafe_allow_html=True,
+    )
+
+    tab_52w, = st.tabs(["📈 52W High Strategy"])
+
+    with tab_52w:
+        st.markdown(
+            """<div class="info-banner">
+            <b>52W High Strategy</b> — Identifies stocks whose 52-week high is at or near
+            their all-time high, indicating the stock is at peak strength. When a stock with
+            <b>strong fundamentals</b> breaks above (or holds near) its 52W high, it signals
+            a potential continuation breakout.<br><br>
+            <b>Best used when:</b> Overall market sentiment is positive / bull market conditions.
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        col_cfg, col_results = st.columns([1, 3])
+
+        with col_cfg:
+            st.markdown("##### Market")
+            market_name = st.selectbox(
+                "Select market",
+                options=list(_MARKETS.keys()),
+                index=0,
+                label_visibility="collapsed",
+            )
+            market_code = _MARKETS[market_name]["code"]
+
+            st.markdown("##### Strategy Parameters")
+            ath_gap = st.slider(
+                "Max gap below ATH (%)",
+                min_value=1.0, max_value=20.0, value=8.0, step=0.5,
+                help="Include stocks whose 52W high is at most this % below their all-time high.",
+            )
+            breakout_thr = st.slider(
+                "Breakout proximity (%)",
+                min_value=0.5, max_value=10.0, value=3.0, step=0.5,
+                help="Price must be within this % below the 52W high to qualify as 'near breakout'.",
+            )
+            min_fund = st.slider(
+                "Min fundamental score (out of 5)",
+                min_value=1, max_value=5, value=3, step=1,
+                help="Criteria: ROE>15%, P/E<40, Rev Growth>5%, Net Margin>8%, D/E<1x.",
+            )
+
+            universe = UNIVERSES.get(market_code, [])
+            st.caption(f"Universe: **{len(universe)} stocks**")
+
+            run_btn = st.button("▶  Run Strategy", type="primary", use_container_width=True)
+
+        with col_results:
+            if not run_btn:
+                st.info(
+                    "Configure the parameters on the left, then click **Run Strategy**.\n\n"
+                    "The scan fetches live price & fundamental data for every stock in the "
+                    "selected market — this typically takes 1–3 minutes."
+                )
+                st.markdown(
+                    """
+**How signals are assigned:**
+
+| Signal | Criteria |
+|--------|----------|
+| 🟢 BUY | Price ≥ 52W high **and** fundamentals strong |
+| 🟡 WATCH | Price within breakout proximity of 52W high **and** fundamentals strong |
+| 🔵 NEAR HIGH | Price within breakout proximity of 52W high, fundamentals weak |
+| ⬜ PASS | Not near 52W high |
+
+**Fundamental checks** (need ≥ min score): ROE > 15% · P/E 0–40 · Revenue growth > 5% · Net margin > 8% · D/E < 1×
+                    """
+                )
+                return
+
+            if not universe:
+                st.warning("No stock universe available for this market.")
+                return
+
+            total = len(universe)
+            st.markdown(f"Scanning **{total} stocks** in {market_name}…")
+            prog_bar = st.progress(0.0)
+            prog_text = st.empty()
+
+            def _on_progress(done: int, t: int):
+                prog_bar.progress(done / t)
+                prog_text.caption(f"{done} / {t} tickers processed…")
+
+            with st.spinner(""):
+                result_df = run_52w_high_strategy(
+                    universe,
+                    ath_gap_threshold=ath_gap,
+                    breakout_threshold=breakout_thr,
+                    min_fund_score=min_fund,
+                    max_workers=25,
+                    progress_cb=_on_progress,
+                )
+
+            prog_bar.empty()
+            prog_text.empty()
+
+            if result_df.empty:
+                st.warning(
+                    "No stocks matched the strategy criteria. "
+                    "Try increasing the ATH gap threshold or loosening other parameters."
+                )
+                return
+
+            n_buy   = (result_df["Signal"] == "BUY").sum()
+            n_watch = (result_df["Signal"] == "WATCH").sum()
+            n_near  = (result_df["Signal"] == "NEAR HIGH").sum()
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Candidates found", len(result_df))
+            c2.metric("BUY signals", int(n_buy))
+            c3.metric("WATCH signals", int(n_watch))
+            c4.metric("Near High", int(n_near))
+
+            # Emoji labels for display
+            signal_emoji = {
+                "BUY": "🟢 BUY",
+                "WATCH": "🟡 WATCH",
+                "NEAR HIGH": "🔵 NEAR HIGH",
+                "PASS": "⬜ PASS",
+            }
+            result_df["Signal"] = result_df["Signal"].map(signal_emoji).fillna(result_df["Signal"])
+
+            display_cols = [
+                "Signal", "Ticker", "Name", "Sector",
+                "Price", "52W High", "All-Time High",
+                "ATH Gap %", "Breakout %",
+                "Fund Score", "Fund Checks",
+                "ROE %", "P/E", "Rev Growth %", "Net Margin %", "D/E",
+            ]
+            currency = _MARKETS[market_name]["symbol"]
+            display_cols = [c for c in display_cols if c in result_df.columns]
+            df_show = result_df[display_cols].copy()
+
+            st.dataframe(
+                df_show,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Signal":        st.column_config.TextColumn("Signal", width="medium"),
+                    "Price":         st.column_config.NumberColumn(f"Price ({currency})", format="%.2f"),
+                    "52W High":      st.column_config.NumberColumn(f"52W High ({currency})", format="%.2f"),
+                    "All-Time High": st.column_config.NumberColumn(f"ATH ({currency})", format="%.2f"),
+                    "ATH Gap %":     st.column_config.NumberColumn("ATH Gap %", format="%.1f %%"),
+                    "Breakout %":    st.column_config.NumberColumn("Breakout %", format="%.1f %%"),
+                    "Fund Score":    st.column_config.NumberColumn("Score /5", format="%d"),
+                    "ROE %":         st.column_config.NumberColumn("ROE %", format="%.1f %%"),
+                    "P/E":           st.column_config.NumberColumn("P/E", format="%.1f x"),
+                    "Rev Growth %":  st.column_config.NumberColumn("Rev Growth %", format="%.1f %%"),
+                    "Net Margin %":  st.column_config.NumberColumn("Net Margin %", format="%.1f %%"),
+                    "D/E":           st.column_config.NumberColumn("D/E", format="%.2f x"),
+                },
+            )
+            st.caption(
+                "ATH Gap % = how far 52W high is from the all-time high (0% = at ATH, -5% = 5% below). "
+                "Breakout % = how current price relates to 52W high (positive = broken out). "
+                "To analyse a stock in depth, copy its ticker and switch to 📊 Stock Analysis."
+            )
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(
@@ -801,7 +972,7 @@ with st.sidebar:
 
     page_mode = st.radio(
         "Mode",
-        ["📊 Stock Analysis", "🔎 Stock Screener", "📁 Portfolio Analysis"],
+        ["📊 Stock Analysis", "🔎 Stock Screener", "📁 Portfolio Analysis", "📐 Technical Strategy"],
         label_visibility="collapsed",
         horizontal=False,
     )
@@ -875,6 +1046,10 @@ if page_mode == "🔎 Stock Screener":
 
 if page_mode == "📁 Portfolio Analysis":
     _render_portfolio(api_key)
+    st.stop()
+
+if page_mode == "📐 Technical Strategy":
+    _render_technical_strategy()
     st.stop()
 
 # ── Search bar ────────────────────────────────────────────────────────────────
