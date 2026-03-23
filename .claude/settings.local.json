@@ -4,7 +4,9 @@
       "Skill(claude-api)",
       "Bash(pip install:*)",
       "Bash(pip3 install:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(pip3 show:*)",
+      "Bash(wc:*)"
     ]
   }
 }

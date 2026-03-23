@@ -8,8 +8,11 @@ from dotenv import load_dotenv
 from src.advanced_analyst import compute_advanced_metrics, fetch_ownership_data, traffic_light
 from src.analyst import analyze_portfolio, analyze_stock, research_stock
 from src.markets import DEFAULT_MARKETS, MARKETS
-from src.screener import UNIVERSES, get_universe_for_markets, screen_stocks
-from src.strategy_52w import run_52w_high_strategy
+from src.screener import UNIVERSES, NORDIC_NORTH, get_universe, get_universe_for_markets, screen_stocks
+from src.strategy_accumulation import run_accumulation_strategy, BENCHMARK_MAP
+from src.strategy_breakout import run_breakout_strategy
+from src.strategy_swedish import run_swedish_strategy
+from src.strategy_value import run_value_strategy
 from src.stock_data import (
     get_key_metrics,
     get_stock_data,
@@ -739,7 +742,7 @@ def _render_screener(selected_markets: list, api_key: str) -> None:
 
         with st.spinner(""):
             result_df = screen_stocks(
-                universe, filters, max_workers=25, progress_cb=_on_progress
+                universe, filters, max_workers=8, progress_cb=_on_progress
             )
 
         prog_bar.empty()
@@ -793,25 +796,29 @@ def _render_screener(selected_markets: list, api_key: str) -> None:
         )
 
 
-# ── Technical Strategy renderer ───────────────────────────────────────────────
+# ── Investment Strategies renderer ────────────────────────────────────────────
 
 def _render_technical_strategy() -> None:
     from src.markets import MARKETS as _MARKETS
 
     st.markdown(
-        "<div class='section-label' style='font-size:1.3rem;'>📐 Technical Strategy</div>",
+        "<div class='section-label' style='font-size:1.3rem;'>💼 Investment Strategies</div>",
         unsafe_allow_html=True,
     )
 
-    tab_52w, = st.tabs(["📈 52W High Strategy"])
+    tab_breakout, tab_value, tab_accum, tab_swedish = st.tabs(["📈 Breakout Analyzer", "💰 Value Investing", "🔍 Accumulation Detection", "🇸🇪 Swedish Growth"])
 
-    with tab_52w:
+    # ── Tab 1: Breakout Analyzer ─────────────────────────────────────────────
+    with tab_breakout:
         st.markdown(
             """<div class="info-banner">
-            <b>52W High Strategy</b> — Identifies stocks whose 52-week high is at or near
-            their all-time high, indicating the stock is at peak strength. When a stock with
-            <b>strong fundamentals</b> breaks above (or holds near) its 52W high, it signals
-            a potential continuation breakout.<br><br>
+            <b>Breakout Analyzer</b> — Two-phase approach to find high-conviction breakout candidates:<br><br>
+            <b>Phase 1</b> — Identifies stocks whose 52-week high is at or near their all-time high,
+            indicating the stock is at peak strength.<br>
+            <b>Phase 2</b> — Scores each candidate on a <b>Composite Score</b> (0–100) combining
+            EPS growth, revenue growth, momentum, valuation, and industry tailwind.<br><br>
+            <b>Composite Score formula:</b>
+            40% EPS growth · 30% Revenue growth · 15% Momentum · 10% Valuation discount · 5% Industry tailwind<br><br>
             <b>Best used when:</b> Overall market sentiment is positive / bull market conditions.
             </div>""",
             unsafe_allow_html=True,
@@ -820,43 +827,66 @@ def _render_technical_strategy() -> None:
         col_cfg, col_results = st.columns([1, 3])
 
         with col_cfg:
-            st.markdown("##### Market")
-            market_name = st.selectbox(
-                "Select market",
+            st.markdown("##### Markets")
+            bo_market_names = st.multiselect(
+                "Select markets",
                 options=list(_MARKETS.keys()),
-                index=0,
+                default=["🇺🇸 United States (NYSE / NASDAQ)"],
                 label_visibility="collapsed",
+                key="bo_markets",
             )
-            market_code = _MARKETS[market_name]["code"]
 
             st.markdown("##### Strategy Parameters")
             ath_gap = st.slider(
                 "Max gap below ATH (%)",
                 min_value=1.0, max_value=20.0, value=8.0, step=0.5,
                 help="Include stocks whose 52W high is at most this % below their all-time high.",
+                key="bo_ath_gap",
             )
             breakout_thr = st.slider(
                 "Breakout proximity (%)",
                 min_value=0.5, max_value=10.0, value=3.0, step=0.5,
                 help="Price must be within this % below the 52W high to qualify as 'near breakout'.",
+                key="bo_breakout",
             )
-            min_fund = st.slider(
-                "Min fundamental score (out of 5)",
-                min_value=1, max_value=5, value=3, step=1,
-                help="Criteria: ROE>15%, P/E<40, Rev Growth>5%, Net Margin>8%, D/E<1x.",
+            min_composite = st.slider(
+                "Min Composite Score",
+                min_value=10, max_value=80, value=40, step=5,
+                help="Minimum composite score (0–100) for BUY/WATCH signals. Lower = more results.",
+                key="bo_min_score",
             )
 
-            universe = UNIVERSES.get(market_code, [])
+            st.markdown("##### Market Cap Filter")
+            cap_filter = st.selectbox(
+                "Market Cap",
+                ["All", "Large Cap (>$10B)", "Mid Cap ($1B–$10B)", "Small Cap ($100M–$1B)"],
+                label_visibility="collapsed",
+                key="bo_cap",
+            )
+
+            st.markdown("##### Top N Results")
+            top_n = st.selectbox(
+                "Show top",
+                [20, 50, 100],
+                label_visibility="collapsed",
+                key="bo_topn",
+            )
+
+            bo_market_codes = [_MARKETS[m]["code"] for m in bo_market_names if m in _MARKETS]
+            universe = [t for code in bo_market_codes for t in get_universe(code)]
+            universe = list(dict.fromkeys(universe))  # deduplicate
             st.caption(f"Universe: **{len(universe)} stocks**")
 
-            run_btn = st.button("▶  Run Strategy", type="primary", use_container_width=True)
+            run_btn = st.button("▶  Run Scan", type="primary", use_container_width=True, key="bo_run")
 
         with col_results:
-            if not run_btn:
+            _has_cached_bo = "bo_cached_results" in st.session_state and st.session_state["bo_cached_results"] is not None
+
+            if not run_btn and not _has_cached_bo:
                 st.info(
-                    "Configure the parameters on the left, then click **Run Strategy**.\n\n"
-                    "The scan fetches live price & fundamental data for every stock in the "
-                    "selected market — this typically takes 1–3 minutes."
+                    "Configure the parameters on the left, then click **Run Scan**.\n\n"
+                    "The scan fetches live price, fundamental, and technical data for every stock — "
+                    "expect 2–5 minutes depending on universe size."
                 )
                 st.markdown(
                     """
@@ -864,103 +894,732 @@ def _render_technical_strategy() -> None:
 
 | Signal | Criteria |
 |--------|----------|
-| 🟢 BUY | Price ≥ 52W high **and** fundamentals strong |
-| 🟡 WATCH | Price within breakout proximity of 52W high **and** fundamentals strong |
-| 🔵 NEAR HIGH | Price within breakout proximity of 52W high, fundamentals weak |
+| 🟢 BUY | Price broke above 52W high **and** Composite Score >= threshold |
+| 🟡 WATCH | Price within breakout proximity of 52W high **and** Composite Score >= threshold |
+| 🔵 NEAR HIGH | Price within breakout proximity, but score below threshold |
 | ⬜ PASS | Not near 52W high |
 
-**Fundamental checks** (need ≥ min score): ROE > 15% · P/E 0–40 · Revenue growth > 5% · Net margin > 8% · D/E < 1×
+**Composite Score (0–100):**
+
+| Weight | Component |
+|--------|-----------|
+| 40% | EPS Growth Score (normalized, higher growth = higher score) |
+| 30% | Revenue CAGR Score |
+| 15% | Momentum Score (52W high proximity + Golden Cross + Volume) |
+| 10% | Valuation Discount Score (PEG or PE vs sector avg) |
+| 5% | Industry Tailwind (AI, Semiconductors, EV, Cloud, Defense...) |
+
+**Fund Score (0–5):** ROE > 15% · P/E 0–40 · Revenue growth > 5% · Net margin > 8% · D/E < 1×
                     """
                 )
-                return
 
-            if not universe:
+            elif not universe:
+                st.warning("Select at least one market to scan.")
+
+            else:
+                # ── Run scan only when button is clicked; cache results ──
+                if run_btn:
+                    total = len(universe)
+                    st.markdown(f"Scanning **{total} stocks** across {len(bo_market_codes)} market(s)...")
+                    prog_bar = st.progress(0.0)
+                    prog_text = st.empty()
+
+                    def _on_progress(done: int, t: int):
+                        prog_bar.progress(done / t)
+                        prog_text.caption(f"{done} / {t} tickers processed...")
+
+                    with st.spinner(""):
+                        result_df = run_breakout_strategy(
+                            universe,
+                            ath_gap_threshold=ath_gap,
+                            breakout_threshold=breakout_thr,
+                            min_composite_score=float(min_composite),
+                            max_workers=8,
+                            progress_cb=_on_progress,
+                        )
+
+                    prog_bar.empty()
+                    prog_text.empty()
+
+                    # Cache in session state so filter changes don't re-fetch
+                    st.session_state["bo_cached_results"] = result_df
+
+                # ── Display cached results (if available) ────────────────
+                result_df = st.session_state.get("bo_cached_results")
+                if result_df is None or (hasattr(result_df, 'empty') and result_df.empty):
+                    if run_btn:
+                        st.warning(
+                            "No stocks matched the strategy criteria. "
+                            "Try increasing the ATH gap threshold, lowering the min composite score, "
+                            "or adding more markets."
+                        )
+                    else:
+                        st.info("Click **Run Scan** to fetch data. Results will be cached so you can change filters without re-fetching.")
+                else:
+                    cap_ranges = {
+                        "Large Cap (>$10B)": (10_000_000_000, None),
+                        "Mid Cap ($1B–$10B)": (1_000_000_000, 10_000_000_000),
+                        "Small Cap ($100M–$1B)": (100_000_000, 1_000_000_000),
+                        "All": (0, None),
+                    }
+                    cap_lo, cap_hi = cap_ranges.get(cap_filter, (0, None))
+
+                    filtered_df = result_df.copy()
+                    # Apply market cap filter
+                    if "Market Cap" in filtered_df.columns:
+                        mask = filtered_df["Market Cap"] >= cap_lo
+                        if cap_hi:
+                            mask &= filtered_df["Market Cap"] <= cap_hi
+                        filtered_df = filtered_df[mask]
+
+                    filtered_df = filtered_df.head(top_n).reset_index(drop=True)
+
+                    if filtered_df.empty:
+                        st.warning("No stocks matched the selected market cap filter. Try changing to 'All'.")
+                    else:
+                        n_buy   = (filtered_df["Signal"] == "BUY").sum()
+                        n_watch = (filtered_df["Signal"] == "WATCH").sum()
+                        top_score = filtered_df["Composite Score"].max() if not filtered_df.empty else 0
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Candidates", len(filtered_df))
+                        c2.metric("BUY signals", int(n_buy))
+                        c3.metric("WATCH signals", int(n_watch))
+                        c4.metric("Top Score", f"{top_score:.1f}")
+
+                        # Emoji labels for display
+                        signal_emoji = {
+                            "BUY": "🟢 BUY",
+                            "WATCH": "🟡 WATCH",
+                            "NEAR HIGH": "🔵 NEAR HIGH",
+                            "PASS": "⬜ PASS",
+                        }
+                        display_df = filtered_df.copy()
+                        display_df["Signal"] = display_df["Signal"].map(signal_emoji).fillna(display_df["Signal"])
+
+                        display_cols = [
+                            "Signal", "Ticker", "Name", "Sector", "Industry",
+                            "Price", "52W High", "All-Time High",
+                            "ATH Gap %", "Breakout %",
+                            "Composite Score", "Fund Score", "Fund Checks",
+                            "Rev CAGR %", "EPS Growth %", "ROE %", "Net Margin %", "D/E",
+                            "P/E", "Industry P/E", "PEG",
+                            "Golden Cross", "Vol Trend", "Tailwind Sector", "E1 Checks",
+                        ]
+                        display_cols = [c for c in display_cols if c in display_df.columns]
+                        df_show = display_df[display_cols].copy()
+
+                        st.dataframe(
+                            df_show,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Signal":          st.column_config.TextColumn("Signal", width="medium"),
+                                "Price":           st.column_config.NumberColumn("Price", format="%.2f"),
+                                "52W High":        st.column_config.NumberColumn("52W High", format="%.2f"),
+                                "All-Time High":   st.column_config.NumberColumn("ATH", format="%.2f"),
+                                "ATH Gap %":       st.column_config.NumberColumn("ATH Gap %", format="%.1f %%"),
+                                "Breakout %":      st.column_config.NumberColumn("Breakout %", format="%.1f %%"),
+                                "Composite Score": st.column_config.ProgressColumn(
+                                    "Composite Score", min_value=0, max_value=100, format="%.1f"
+                                ),
+                                "Fund Score":      st.column_config.NumberColumn("Fund /5", format="%d"),
+                                "Rev CAGR %":      st.column_config.NumberColumn("Rev CAGR %", format="%.1f %%"),
+                                "EPS Growth %":    st.column_config.NumberColumn("EPS Growth %", format="%.1f %%"),
+                                "ROE %":           st.column_config.NumberColumn("ROE %", format="%.1f %%"),
+                                "Net Margin %":    st.column_config.NumberColumn("Net Margin %", format="%.1f %%"),
+                                "D/E":             st.column_config.NumberColumn("D/E", format="%.2f x"),
+                                "P/E":             st.column_config.NumberColumn("P/E", format="%.1f x"),
+                                "Industry P/E":    st.column_config.NumberColumn("Industry P/E", format="%.0f x"),
+                                "PEG":             st.column_config.NumberColumn("PEG", format="%.2f"),
+                                "Vol Trend":       st.column_config.NumberColumn("Vol Trend", format="%.2f x"),
+                            },
+                        )
+
+                        with st.expander("Score Breakdown"):
+                            score_cols = [
+                                "Ticker", "Name", "Composite Score",
+                                "EPS Score", "Rev Score", "Momentum Score", "Val Score",
+                                "E1 Checks", "Market Cap",
+                            ]
+                            score_cols = [c for c in score_cols if c in filtered_df.columns]
+                            df_scores = filtered_df[score_cols].copy()
+                            if "Market Cap" in df_scores.columns:
+                                df_scores["Market Cap"] = df_scores["Market Cap"].apply(
+                                    lambda v: f"${v/1e9:.2f}B" if v >= 1e9
+                                    else (f"${v/1e6:.0f}M" if v >= 1e6 else "—")
+                                    if pd.notna(v) and v > 0 else "—"
+                                )
+                            st.dataframe(
+                                df_scores,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Composite Score": st.column_config.ProgressColumn(
+                                        "Composite", min_value=0, max_value=100, format="%.1f"
+                                    ),
+                                    "EPS Score":       st.column_config.NumberColumn("EPS", format="%.1f"),
+                                    "Rev Score":       st.column_config.NumberColumn("Rev", format="%.1f"),
+                                    "Momentum Score":  st.column_config.NumberColumn("Momentum", format="%.1f"),
+                                    "Val Score":       st.column_config.NumberColumn("Valuation", format="%.1f"),
+                                },
+                            )
+
+                        st.caption(
+                            "ATH Gap % = how far 52W high is from the all-time high (0% = at ATH, -5% = 5% below). "
+                            "Breakout % = how current price relates to 52W high (positive = broken out). "
+                            "Vol Trend: >1 = volume increasing vs prior 30 days. "
+                            "Copy ticker → switch to 📊 Stock Analysis for a deep dive."
+                        )
+
+    # ── Tab 2: Value Investing ────────────────────────────────────────────────
+    with tab_value:
+        st.markdown(
+            """<div class="info-banner">
+            <b>Value Investing Strategy</b> — Identifies undervalued stocks with strong promoter
+            conviction by applying three classic filters:<br><br>
+            📉 <b>P/E &lt; 20</b> — Stock is not overpriced on earnings<br>
+            📚 <b>P/B &lt; 2</b> — Trading near or below book value<br>
+            👔 <b>Promoter / Insider Holding &gt; 60%</b> — High insider ownership signals confidence
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        col_cfg, col_results = st.columns([1, 3])
+
+        with col_cfg:
+            st.markdown("##### Market")
+            market_name_vi = st.selectbox(
+                "Select market",
+                options=list(_MARKETS.keys()),
+                index=0,
+                label_visibility="collapsed",
+                key="vi_market",
+            )
+            market_code_vi = _MARKETS[market_name_vi]["code"]
+
+            st.markdown("##### Filter Parameters")
+            max_pe_vi = st.slider(
+                "Max P/E ratio",
+                min_value=1.0, max_value=50.0, value=20.0, step=0.5,
+                key="vi_max_pe",
+                help="Only include stocks with trailing P/E below this threshold.",
+            )
+            max_pb_vi = st.slider(
+                "Max P/B ratio",
+                min_value=0.1, max_value=5.0, value=2.0, step=0.1,
+                key="vi_max_pb",
+                help="Only include stocks trading below this price-to-book ratio.",
+            )
+            min_insider_vi = st.slider(
+                "Min Promoter / Insider Holding (%)",
+                min_value=10.0, max_value=90.0, value=60.0, step=1.0,
+                key="vi_min_insider",
+                help="Minimum insider/promoter ownership %. Uses yfinance heldPercentInsiders.",
+            )
+
+            universe_vi = get_universe(market_code_vi)
+            st.caption(f"Universe: **{len(universe_vi)} stocks**")
+
+            run_btn_vi = st.button(
+                "▶  Run Strategy", type="primary", use_container_width=True, key="vi_run"
+            )
+
+        with col_results:
+            if not run_btn_vi:
+                st.info(
+                    "Configure the parameters on the left, then click **Run Strategy**.\n\n"
+                    "The scan fetches live data for every stock in the selected market."
+                )
+                st.markdown(
+                    """
+**Criteria applied:**
+
+| Filter | Threshold |
+|--------|-----------|
+| P/E ratio | < selected max (default 20) |
+| P/B ratio | < selected max (default 2) |
+| Insider / Promoter % | > selected min (default 60%) |
+
+**Note:** Insider/Promoter % uses Yahoo Finance's `heldPercentInsiders` field.
+For Indian markets this aligns closely with promoter holding disclosures.
+                    """
+                )
+
+            elif not universe_vi:
                 st.warning("No stock universe available for this market.")
-                return
 
-            total = len(universe)
-            st.markdown(f"Scanning **{total} stocks** in {market_name}…")
-            prog_bar = st.progress(0.0)
-            prog_text = st.empty()
+            else:
+                total_vi = len(universe_vi)
+                st.markdown(f"Scanning **{total_vi} stocks** in {market_name_vi}…")
+                prog_bar_vi = st.progress(0.0)
+                prog_text_vi = st.empty()
 
-            def _on_progress(done: int, t: int):
-                prog_bar.progress(done / t)
-                prog_text.caption(f"{done} / {t} tickers processed…")
+                def _vi_progress(done: int, t: int):
+                    prog_bar_vi.progress(done / t)
+                    prog_text_vi.caption(f"{done} / {t} tickers processed…")
 
-            with st.spinner(""):
-                result_df = run_52w_high_strategy(
-                    universe,
-                    ath_gap_threshold=ath_gap,
-                    breakout_threshold=breakout_thr,
-                    min_fund_score=min_fund,
-                    max_workers=25,
-                    progress_cb=_on_progress,
+                with st.spinner(""):
+                    result_df_vi = run_value_strategy(
+                        universe_vi,
+                        max_pe=max_pe_vi,
+                        max_pb=max_pb_vi,
+                        min_insider_pct=min_insider_vi,
+                        max_workers=8,
+                        progress_cb=_vi_progress,
+                    )
+
+                prog_bar_vi.empty()
+                prog_text_vi.empty()
+
+                if result_df_vi.empty:
+                    st.warning(
+                        "No stocks matched the value criteria. "
+                        "Try relaxing the P/E, P/B, or insider holding thresholds."
+                    )
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Matches Found", len(result_df_vi))
+                    c2.metric("Lowest P/E", f"{result_df_vi['P/E'].min():.1f}x")
+                    c3.metric("Avg Insider %", f"{result_df_vi['Insider/Promoter %'].mean():.1f}%")
+
+                    st.markdown(f"##### {len(result_df_vi)} Value Stocks Found (sorted by P/E ↑)")
+
+                    df_vi_show = result_df_vi.copy()
+                    if "Market Cap" in df_vi_show.columns:
+                        df_vi_show["Market Cap"] = df_vi_show["Market Cap"].apply(
+                            lambda v: f"${v/1e9:.2f}B" if v >= 1e9
+                            else (f"${v/1e6:.0f}M" if v >= 1e6 else "—")
+                            if pd.notna(v) and v > 0 else "—"
+                        )
+
+                    st.dataframe(
+                        df_vi_show,
+                        use_container_width=True,
+                        column_config={
+                            "P/E":                   st.column_config.NumberColumn("P/E",              format="%.1f x"),
+                            "P/B":                   st.column_config.NumberColumn("P/B",              format="%.2f x"),
+                            "Insider/Promoter %":    st.column_config.NumberColumn("Insider %",        format="%.1f %%"),
+                            "Dividend Yield %":      st.column_config.NumberColumn("Div Yield %",      format="%.2f %%"),
+                            "ROE %":                 st.column_config.NumberColumn("ROE %",            format="%.1f %%"),
+                            "D/E":                   st.column_config.NumberColumn("D/E",              format="%.2f x"),
+                        },
+                    )
+                    st.caption(
+                        "Sorted by P/E ascending (cheapest first). "
+                        "Insider % = Yahoo Finance heldPercentInsiders (promoter holding proxy). "
+                        "Copy ticker → switch to 📊 Stock Analysis for a deep dive."
+                    )
+
+    # ── Tab 3: Accumulation Detection ──────────────────────────────────────────
+    with tab_accum:
+        st.markdown(
+            """<div class="info-banner">
+            <b>Accumulation Detection</b> — Identifies stocks being quietly accumulated by
+            institutional investors before a breakout.<br><br>
+            <b>13-rule scoring system</b> across 5 groups:<br>
+            📈 <b>Trend Stabilization (A)</b> — SMA50 rising, price near SMA50, above 60-day low<br>
+            📦 <b>Base Formation (B)</b> — Range compression, low volatility, sideways behavior<br>
+            📊 <b>Volume Accumulation (C)</b> — Up-volume dominance, bullish volume bars, no distribution<br>
+            💪 <b>Relative Strength (D)</b> — Outperforming benchmark, strong closes<br>
+            🎯 <b>Pre-Breakout (E)</b> — Near 20-day high, not overextended<br><br>
+            <b>Qualifies:</b> Score >= 10 <b>AND</b> mandatory volume/RS checks (C1, C2, D1) pass.
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        col_cfg_acc, col_results_acc = st.columns([1, 3])
+
+        with col_cfg_acc:
+            st.markdown("##### Markets")
+            acc_market_names = st.multiselect(
+                "Select markets",
+                options=list(_MARKETS.keys()),
+                default=["🇺🇸 United States (NYSE / NASDAQ)"],
+                label_visibility="collapsed",
+                key="acc_markets",
+            )
+
+            st.markdown("##### Benchmark")
+            acc_market_codes = [_MARKETS[m]["code"] for m in acc_market_names if m in _MARKETS]
+            default_bench = BENCHMARK_MAP.get(acc_market_codes[0], "^GSPC") if acc_market_codes else "^GSPC"
+            acc_benchmark = st.text_input(
+                "Benchmark ticker",
+                value=default_bench,
+                key="acc_benchmark",
+                help="Index ticker for relative strength calculation. Auto-set from first selected market.",
+            )
+
+            st.markdown("##### Strategy Parameters")
+            acc_min_score = st.slider(
+                "Min Accumulation Score",
+                min_value=5, max_value=13, value=7, step=1,
+                key="acc_min_score",
+                help="Minimum score (out of 13) to include in results. Lower = more results.",
+            )
+
+            st.markdown("##### Market Cap Filter")
+            acc_cap_filter = st.selectbox(
+                "Market Cap",
+                ["All", "Large Cap (>$10B)", "Mid Cap ($1B–$10B)", "Small Cap ($100M–$1B)"],
+                label_visibility="collapsed",
+                key="acc_cap",
+            )
+
+            st.markdown("##### Top N Results")
+            acc_top_n = st.selectbox(
+                "Show top",
+                [20, 50, 100],
+                label_visibility="collapsed",
+                key="acc_topn",
+            )
+
+            acc_universe = [t for code in acc_market_codes for t in get_universe(code)]
+            acc_universe = list(dict.fromkeys(acc_universe))
+            st.caption(f"Universe: **{len(acc_universe)} stocks**")
+
+            acc_run_btn = st.button("▶  Run Scan", type="primary", use_container_width=True, key="acc_run")
+
+        with col_results_acc:
+            _has_cached_acc = "acc_cached_results" in st.session_state and st.session_state["acc_cached_results"] is not None
+
+            if not acc_run_btn and not _has_cached_acc:
+                st.info(
+                    "Configure the parameters on the left, then click **Run Scan**.\n\n"
+                    "The scan fetches 6 months of OHLCV data for every stock — "
+                    "expect 2–5 minutes depending on universe size."
+                )
+                st.markdown(
+                    """
+**How signals are assigned:**
+
+| Signal | Criteria |
+|--------|----------|
+| 🟢 ACCUM + BREAKOUT | Score >= 10, mandatory checks pass, price breaks above 20-day high on heavy volume |
+| 🟡 ACCUMULATION | Score >= 10, mandatory checks (C1, C2, D1) pass |
+| 🔵 BUILDING | Score >= 7, mandatory checks pass |
+| ⬜ NEUTRAL | Below thresholds |
+
+**Mandatory checks:** C1 (down-volume < up-volume) · C2 (2+ bullish high-vol bars) · D1 (relative strength above average)
+
+**Risk Management:** Stop loss at 10-day low, target at 3:1 reward/risk ratio.
+                    """
                 )
 
-            prog_bar.empty()
-            prog_text.empty()
+            elif not acc_universe:
+                st.warning("Select at least one market to scan.")
 
-            if result_df.empty:
-                st.warning(
-                    "No stocks matched the strategy criteria. "
-                    "Try increasing the ATH gap threshold or loosening other parameters."
+            else:
+                if acc_run_btn:
+                    total_acc = len(acc_universe)
+                    st.markdown(f"Scanning **{total_acc} stocks** across {len(acc_market_codes)} market(s)...")
+                    prog_bar_acc = st.progress(0.0)
+                    prog_text_acc = st.empty()
+
+                    def _acc_progress(done: int, t: int):
+                        prog_bar_acc.progress(done / t)
+                        prog_text_acc.caption(f"{done} / {t} tickers processed...")
+
+                    with st.spinner(""):
+                        result_df_acc = run_accumulation_strategy(
+                            acc_universe,
+                            benchmark_ticker=acc_benchmark,
+                            min_score=acc_min_score,
+                            max_workers=8,
+                            progress_cb=_acc_progress,
+                        )
+
+                    prog_bar_acc.empty()
+                    prog_text_acc.empty()
+                    st.session_state["acc_cached_results"] = result_df_acc
+
+                result_df_acc = st.session_state.get("acc_cached_results")
+                if result_df_acc is None or (hasattr(result_df_acc, 'empty') and result_df_acc.empty):
+                    if acc_run_btn:
+                        st.warning(
+                            "No stocks matched the accumulation criteria. "
+                            "Try lowering the min score or adding more markets."
+                        )
+                    else:
+                        st.info("Click **Run Scan** to fetch data. Results will be cached so you can change filters without re-fetching.")
+                else:
+                    cap_ranges_acc = {
+                        "Large Cap (>$10B)": (10_000_000_000, None),
+                        "Mid Cap ($1B–$10B)": (1_000_000_000, 10_000_000_000),
+                        "Small Cap ($100M–$1B)": (100_000_000, 1_000_000_000),
+                        "All": (0, None),
+                    }
+                    cap_lo_acc, cap_hi_acc = cap_ranges_acc.get(acc_cap_filter, (0, None))
+
+                    filtered_df_acc = result_df_acc.copy()
+                    if "Market Cap" in filtered_df_acc.columns:
+                        mask_acc = filtered_df_acc["Market Cap"] >= cap_lo_acc
+                        if cap_hi_acc:
+                            mask_acc &= filtered_df_acc["Market Cap"] <= cap_hi_acc
+                        filtered_df_acc = filtered_df_acc[mask_acc]
+
+                    filtered_df_acc = filtered_df_acc.head(acc_top_n).reset_index(drop=True)
+
+                    if filtered_df_acc.empty:
+                        st.warning("No stocks matched the selected market cap filter. Try changing to 'All'.")
+                    else:
+                        n_breakout_acc = (filtered_df_acc["Signal"] == "ACCUMULATION + BREAKOUT").sum()
+                        n_accum = (filtered_df_acc["Signal"] == "ACCUMULATION").sum()
+                        n_building = (filtered_df_acc["Signal"] == "BUILDING").sum()
+                        top_score_acc = filtered_df_acc["Accum Score"].max() if not filtered_df_acc.empty else 0
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Candidates", len(filtered_df_acc))
+                        c2.metric("🟢 Breakouts", int(n_breakout_acc))
+                        c3.metric("🟡 Accumulating", int(n_accum))
+                        c4.metric("Top Score", f"{top_score_acc}/13")
+
+                        signal_emoji_acc = {
+                            "ACCUMULATION + BREAKOUT": "🟢 ACCUM + BREAKOUT",
+                            "ACCUMULATION": "🟡 ACCUMULATION",
+                            "BUILDING": "🔵 BUILDING",
+                            "NEUTRAL": "⬜ NEUTRAL",
+                        }
+                        display_df_acc = filtered_df_acc.copy()
+                        display_df_acc["Signal"] = display_df_acc["Signal"].map(signal_emoji_acc).fillna(display_df_acc["Signal"])
+
+                        display_cols_acc = [
+                            "Signal", "Ticker", "Name", "Sector", "Industry",
+                            "Price", "50-SMA", "ATR/Price %", "Range Compression %",
+                            "Accum Score", "Up/Down Vol Ratio", "Rel Strength",
+                            "Bullish Vol Bars", "Dist Bars",
+                            "Trend Checks", "Base Checks", "Volume Checks",
+                            "RS Checks", "Breakout Checks",
+                            "Stop Loss", "Target",
+                        ]
+                        display_cols_acc = [c for c in display_cols_acc if c in display_df_acc.columns]
+                        df_show_acc = display_df_acc[display_cols_acc].copy()
+
+                        st.dataframe(
+                            df_show_acc,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Signal":               st.column_config.TextColumn("Signal", width="medium"),
+                                "Price":                st.column_config.NumberColumn("Price", format="%.2f"),
+                                "50-SMA":               st.column_config.NumberColumn("50-SMA", format="%.2f"),
+                                "ATR/Price %":          st.column_config.NumberColumn("ATR/Price %", format="%.2f %%"),
+                                "Range Compression %":  st.column_config.NumberColumn("Range %", format="%.1f %%"),
+                                "Accum Score":          st.column_config.ProgressColumn(
+                                    "Score /13", min_value=0, max_value=13, format="%d"
+                                ),
+                                "Up/Down Vol Ratio":    st.column_config.NumberColumn("Up/Dn Vol", format="%.2f"),
+                                "Rel Strength":         st.column_config.NumberColumn("RS", format="%.4f"),
+                                "Bullish Vol Bars":     st.column_config.NumberColumn("Bull Bars", format="%d"),
+                                "Dist Bars":            st.column_config.NumberColumn("Dist Bars", format="%d"),
+                                "Stop Loss":            st.column_config.NumberColumn("Stop", format="%.2f"),
+                                "Target":               st.column_config.NumberColumn("Target", format="%.2f"),
+                            },
+                        )
+
+                        with st.expander("Rule Group Breakdown"):
+                            breakdown_cols = [
+                                "Ticker", "Name", "Accum Score",
+                                "Trend Checks", "Base Checks", "Volume Checks",
+                                "RS Checks", "Breakout Checks", "Market Cap",
+                            ]
+                            breakdown_cols = [c for c in breakdown_cols if c in filtered_df_acc.columns]
+                            df_breakdown = filtered_df_acc[breakdown_cols].copy()
+                            if "Market Cap" in df_breakdown.columns:
+                                df_breakdown["Market Cap"] = df_breakdown["Market Cap"].apply(
+                                    lambda v: f"${v/1e9:.2f}B" if v >= 1e9
+                                    else (f"${v/1e6:.0f}M" if v >= 1e6 else "—")
+                                    if pd.notna(v) and v > 0 else "—"
+                                )
+                            st.dataframe(
+                                df_breakdown,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Accum Score": st.column_config.ProgressColumn(
+                                        "Score /13", min_value=0, max_value=13, format="%d"
+                                    ),
+                                },
+                            )
+
+                        st.caption(
+                            "Score = count of 13 boolean rules passing (0–13). "
+                            "Mandatory: C1 (up-volume dominance), C2 (bullish high-vol bars), D1 (relative strength). "
+                            "Stop Loss = 10-day low. Target = entry + 3× risk. "
+                            "Copy ticker → switch to 📊 Stock Analysis for a deep dive."
+                        )
+
+    # ── Tab 4: Swedish Growth ────────────────────────────────────────────────
+    with tab_swedish:
+        st.markdown(
+            """<div class="info-banner">
+            <b>Swedish Growth Strategy</b> — Screens Nordic North stocks for high-growth
+            small-mid caps on Nasdaq Stockholm.<br><br>
+            <b>9 quantitative filters:</b><br>
+            1. Market Cap: 500M – 15B SEK<br>
+            2. Revenue Growth >= 20% YoY<br>
+            3. Gross Margin >= 40%<br>
+            4. Revenue >= 200M SEK<br>
+            5. Operating Margin improving (current > prior year)<br>
+            6. Price >= 85% of 52-week high<br>
+            7. 12-month return > OMX Stockholm index<br>
+            8. Debt/Equity < 1<br>
+            9. Daily liquidity >= 5M SEK<br><br>
+            <b>Universe:</b> Nordic North — Swedish large/mid/small caps on Nasdaq Stockholm.
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        col_cfg_swe, col_results_swe = st.columns([1, 3])
+
+        with col_cfg_swe:
+            st.markdown("##### Universe")
+            st.caption(f"Nordic North: **{len(NORDIC_NORTH)} stocks**")
+
+            st.markdown("##### Benchmark")
+            swe_benchmark = st.text_input(
+                "Benchmark ticker",
+                value="^OMX",
+                key="swe_benchmark",
+                help="OMX Stockholm 30 index for 12-month relative return comparison.",
+            )
+
+            st.markdown("##### Top N Results")
+            swe_top_n = st.selectbox(
+                "Show top",
+                [20, 50, 100, 200],
+                label_visibility="collapsed",
+                key="swe_topn",
+            )
+
+            swe_run_btn = st.button("Run Scan", type="primary", use_container_width=True, key="swe_run")
+
+        with col_results_swe:
+            _has_cached_swe = "swe_cached_results" in st.session_state and st.session_state["swe_cached_results"] is not None
+
+            if not swe_run_btn and not _has_cached_swe:
+                st.info(
+                    "Click **Run Scan** to screen the Nordic North universe.\n\n"
+                    "The scan fetches fundamentals + 1-year price history + income statements — "
+                    "expect 3–8 minutes for the full universe."
                 )
-                return
+                st.markdown(
+                    """
+**How signals are assigned:**
 
-            n_buy   = (result_df["Signal"] == "BUY").sum()
-            n_watch = (result_df["Signal"] == "WATCH").sum()
-            n_near  = (result_df["Signal"] == "NEAR HIGH").sum()
+| Signal | Criteria |
+|--------|----------|
+| STRONG BUY | All applicable checks pass (9/9 or all non-N/A) |
+| BUY | 7–8 checks pass |
+| WATCH | 5–6 checks pass |
+| FAIL | Fewer than 5 checks pass |
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Candidates found", len(result_df))
-            c2.metric("BUY signals", int(n_buy))
-            c3.metric("WATCH signals", int(n_watch))
-            c4.metric("Near High", int(n_near))
+**Key thresholds:** Market Cap 500M–15B SEK, Revenue >= 200M SEK, Rev Growth >= 20%,
+Gross Margin >= 40%, D/E < 1, Liquidity >= 5M SEK/day, Price >= 85% of 52W High,
+12M return beats OMX.
+                    """
+                )
 
-            # Emoji labels for display
-            signal_emoji = {
-                "BUY": "🟢 BUY",
-                "WATCH": "🟡 WATCH",
-                "NEAR HIGH": "🔵 NEAR HIGH",
-                "PASS": "⬜ PASS",
-            }
-            result_df["Signal"] = result_df["Signal"].map(signal_emoji).fillna(result_df["Signal"])
+            elif not NORDIC_NORTH:
+                st.warning("Nordic North universe is empty.")
 
-            display_cols = [
-                "Signal", "Ticker", "Name", "Sector",
-                "Price", "52W High", "All-Time High",
-                "ATH Gap %", "Breakout %",
-                "Fund Score", "Fund Checks",
-                "ROE %", "P/E", "Rev Growth %", "Net Margin %", "D/E",
-            ]
-            currency = _MARKETS[market_name]["symbol"]
-            display_cols = [c for c in display_cols if c in result_df.columns]
-            df_show = result_df[display_cols].copy()
+            else:
+                if swe_run_btn:
+                    total_swe = len(NORDIC_NORTH)
+                    st.markdown(f"Scanning **{total_swe} stocks** in Nordic North universe...")
+                    prog_bar_swe = st.progress(0.0)
+                    prog_text_swe = st.empty()
 
-            st.dataframe(
-                df_show,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Signal":        st.column_config.TextColumn("Signal", width="medium"),
-                    "Price":         st.column_config.NumberColumn(f"Price ({currency})", format="%.2f"),
-                    "52W High":      st.column_config.NumberColumn(f"52W High ({currency})", format="%.2f"),
-                    "All-Time High": st.column_config.NumberColumn(f"ATH ({currency})", format="%.2f"),
-                    "ATH Gap %":     st.column_config.NumberColumn("ATH Gap %", format="%.1f %%"),
-                    "Breakout %":    st.column_config.NumberColumn("Breakout %", format="%.1f %%"),
-                    "Fund Score":    st.column_config.NumberColumn("Score /5", format="%d"),
-                    "ROE %":         st.column_config.NumberColumn("ROE %", format="%.1f %%"),
-                    "P/E":           st.column_config.NumberColumn("P/E", format="%.1f x"),
-                    "Rev Growth %":  st.column_config.NumberColumn("Rev Growth %", format="%.1f %%"),
-                    "Net Margin %":  st.column_config.NumberColumn("Net Margin %", format="%.1f %%"),
-                    "D/E":           st.column_config.NumberColumn("D/E", format="%.2f x"),
-                },
-            )
-            st.caption(
-                "ATH Gap % = how far 52W high is from the all-time high (0% = at ATH, -5% = 5% below). "
-                "Breakout % = how current price relates to 52W high (positive = broken out). "
-                "To analyse a stock in depth, copy its ticker and switch to 📊 Stock Analysis."
-            )
+                    def _swe_progress(done: int, t: int):
+                        prog_bar_swe.progress(done / t)
+                        prog_text_swe.caption(f"{done} / {t} tickers processed...")
+
+                    with st.spinner(""):
+                        result_df_swe = run_swedish_strategy(
+                            NORDIC_NORTH,
+                            benchmark_ticker=swe_benchmark,
+                            max_workers=8,
+                            progress_cb=_swe_progress,
+                        )
+
+                    prog_bar_swe.empty()
+                    prog_text_swe.empty()
+                    st.session_state["swe_cached_results"] = result_df_swe
+
+                result_df_swe = st.session_state.get("swe_cached_results")
+                if result_df_swe is None or (hasattr(result_df_swe, 'empty') and result_df_swe.empty):
+                    if swe_run_btn:
+                        st.warning(
+                            "No stocks matched the Swedish Growth criteria. "
+                            "This is expected — the strategy is highly selective."
+                        )
+                    else:
+                        st.info("Click **Run Scan** to fetch data. Results will be cached.")
+                else:
+                    filtered_df_swe = result_df_swe.head(swe_top_n).reset_index(drop=True)
+
+                    if filtered_df_swe.empty:
+                        st.warning("No results to display.")
+                    else:
+                        n_strong = (filtered_df_swe["Signal"] == "STRONG BUY").sum()
+                        n_buy = (filtered_df_swe["Signal"] == "BUY").sum()
+                        n_watch = (filtered_df_swe["Signal"] == "WATCH").sum()
+                        n_total_swe = len(filtered_df_swe)
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Candidates", n_total_swe)
+                        c2.metric("Strong Buy", int(n_strong))
+                        c3.metric("Buy", int(n_buy))
+                        c4.metric("Watch", int(n_watch))
+
+                        signal_emoji_swe = {
+                            "STRONG BUY": "STRONG BUY",
+                            "BUY": "BUY",
+                            "WATCH": "WATCH",
+                            "FAIL": "FAIL",
+                        }
+                        display_df_swe = filtered_df_swe.copy()
+                        display_df_swe["Signal"] = display_df_swe["Signal"].map(signal_emoji_swe).fillna(display_df_swe["Signal"])
+
+                        display_cols_swe = [
+                            "Signal", "Ticker", "Name", "Sector", "Industry",
+                            "Price", "Market Cap (M)", "Revenue (M)",
+                            "Rev Growth %", "Gross Margin %",
+                            "Op Margin %", "Op Margin Prev %",
+                            "Price/52W %", "12M Return %", "OMX Return %",
+                            "D/E", "Liquidity (M)", "Checks Passed",
+                        ]
+                        display_cols_swe = [c for c in display_cols_swe if c in display_df_swe.columns]
+                        df_show_swe = display_df_swe[display_cols_swe].copy()
+
+                        st.dataframe(
+                            df_show_swe,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Signal":             st.column_config.TextColumn("Signal", width="medium"),
+                                "Price":              st.column_config.NumberColumn("Price", format="%.2f"),
+                                "Market Cap (M)":     st.column_config.NumberColumn("Mkt Cap (M SEK)", format="%.0f"),
+                                "Revenue (M)":        st.column_config.NumberColumn("Rev (M SEK)", format="%.0f"),
+                                "Rev Growth %":       st.column_config.NumberColumn("Rev Growth %", format="%.1f %%"),
+                                "Gross Margin %":     st.column_config.NumberColumn("Gross Mgn %", format="%.1f %%"),
+                                "Op Margin %":        st.column_config.NumberColumn("Op Mgn %", format="%.1f %%"),
+                                "Op Margin Prev %":   st.column_config.NumberColumn("Op Mgn Prev %", format="%.1f %%"),
+                                "Price/52W %":        st.column_config.NumberColumn("Price/52W %", format="%.1f %%"),
+                                "12M Return %":       st.column_config.NumberColumn("12M Ret %", format="%.1f %%"),
+                                "OMX Return %":       st.column_config.NumberColumn("OMX Ret %", format="%.1f %%"),
+                                "D/E":                st.column_config.NumberColumn("D/E", format="%.2f x"),
+                                "Liquidity (M)":      st.column_config.NumberColumn("Liq (M SEK)", format="%.1f"),
+                            },
+                        )
+
+                        st.caption(
+                            "Sorted by signal priority, then Revenue Growth descending. "
+                            "Market Cap and Revenue are in SEK. D/E = Debt-to-Equity ratio. "
+                            "Liquidity = avg daily volume x price. "
+                            "Op Margin Improving = current year > prior year (from income statement). "
+                            "Copy ticker to Stock Analysis for a deep dive."
+                        )
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -972,7 +1631,7 @@ with st.sidebar:
 
     page_mode = st.radio(
         "Mode",
-        ["📊 Stock Analysis", "🔎 Stock Screener", "📁 Portfolio Analysis", "📐 Technical Strategy"],
+        ["📊 Stock Analysis", "🔎 Stock Screener", "📁 Portfolio Analysis", "💼 Investment Strategies"],
         label_visibility="collapsed",
         horizontal=False,
     )
@@ -1048,7 +1707,7 @@ if page_mode == "📁 Portfolio Analysis":
     _render_portfolio(api_key)
     st.stop()
 
-if page_mode == "📐 Technical Strategy":
+if page_mode == "💼 Investment Strategies":
     _render_technical_strategy()
     st.stop()
 

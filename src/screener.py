@@ -1,7 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import StringIO
 from typing import Callable, Dict, List, Optional
+import threading
+import time
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 # ── Stock universes by market code ────────────────────────────────────────────
@@ -158,12 +162,59 @@ UNIVERSES: Dict[str, List[str]] = {
         "IDR.MC", "SGRE.MC", "SLR.MC", "PHP.MC", "OLIN.MC",
     ],
     "SE": [
-        "VOLV-B.ST", "ERIC-B.ST", "HM-B.ST", "NDA-SE.ST", "SEB-A.ST",
-        "SWED-A.ST", "INVE-B.ST", "SHB-A.ST", "ATCO-A.ST", "SAND.ST",
-        "SKF-B.ST", "ESSITY-B.ST", "SINCH.ST", "NIBE-B.ST", "ALFA.ST",
-        "ASSA-B.ST", "AXFO.ST", "BOL.ST", "EVO.ST", "GETI-B.ST",
-        "HEXA-B.ST", "HUSQ-B.ST", "LIFCO-B.ST", "LOOMIS.ST", "LUND-B.ST",
-        "SWECO-B.ST", "TELE2-B.ST", "TELIA.ST", "ABB.ST", "SOBI.ST",
+        # ── Large Cap – Banks & Financials ────────────────────────────────────────
+        "NDA-SE.ST", "SEB-A.ST", "SEB-C.ST", "SWED-A.ST", "SHB-A.ST", "SHB-B.ST",
+        "INVE-A.ST", "INVE-B.ST", "EQT.ST", "KINV-B.ST", "LUND-B.ST",
+        "LATOUR-B.ST", "RATOS-B.ST", "BURE.ST", "INTRUM.ST", "COOR.ST",
+        # ── Large Cap – Industrials ───────────────────────────────────────────────
+        "VOLV-A.ST", "VOLV-B.ST", "ATCO-A.ST", "ATCO-B.ST", "SAND.ST",
+        "ALFA.ST", "SKF-A.ST", "SKF-B.ST", "ASSA-B.ST", "SECU-B.ST", "SKA-B.ST",
+        "HEXA-B.ST", "HUSQ-A.ST", "HUSQ-B.ST", "SWECO-B.ST", "ABB.ST",
+        "INDT.ST", "SAAB-B.ST", "ADDT-B.ST", "BUFAB.ST", "TROAX.ST",
+        "ALIV-SDB.ST", "ELUX-A.ST", "ELUX-B.ST", "DOM.ST", "NOLA-B.ST",
+        "LOOMIS.ST", "TREL-B.ST", "ARJO-B.ST", "BRAV.ST", "PEAB-B.ST",
+        "EPIROC-A.ST", "EPIROC-B.ST", "LIAB.ST", "SYSR.ST", "BERGB.ST",
+        # ── Large Cap – Technology & Telecom ─────────────────────────────────────
+        "ERIC-A.ST", "ERIC-B.ST", "TELE2-B.ST", "TELIA.ST", "SINCH.ST", "MYCR.ST",
+        # ── Large Cap – Consumer & Retail ─────────────────────────────────────────
+        "HM-A.ST", "HM-B.ST", "AXFO.ST", "ICA.ST", "THULE.ST", "MEKO.ST",
+        # ── Large Cap – Healthcare & Life Science ─────────────────────────────────
+        "ESSITY-A.ST", "ESSITY-B.ST", "GETI-B.ST", "SOBI.ST", "EKTA-B.ST",
+        "NIBE-B.ST", "LIFCO-B.ST", "VITRO.ST", "XVIVO.ST", "CAMX.ST",
+        "MEDICOVER-B.ST", "RECIP-B.ST",
+        # ── Large Cap – Real Estate ───────────────────────────────────────────────
+        "BALD-B.ST", "FABG.ST", "JM.ST", "SBB-B.ST", "SAGAX-B.ST",
+        "WIHL.ST", "NYFOSA.ST", "DIOS.ST", "HUFV-A.ST", "HUFV-C.ST",
+        "PLAZ-B.ST", "CATE.ST", "PNDX-B.ST",
+        # ── Large Cap – Materials & Energy ────────────────────────────────────────
+        "BOL.ST", "SSAB-A.ST", "SSAB-B.ST", "SCA-A.ST", "SCA-B.ST",
+        "HPOL-B.ST", "HOLM-B.ST", "GRNG.ST",
+        # ── Large Cap – Gaming, Media & Entertainment ─────────────────────────────
+        "EVO.ST", "BETS-B.ST", "KIND-SDB.ST", "EMBRAC-B.ST", "PDX.ST",
+        "SF.ST", "NENT-B.ST",
+        # ── Mid Cap – Industrials ─────────────────────────────────────────────────
+        "ANOD-B.ST", "ADDL-B.ST", "BEIA-B.ST", "BEIJ-B.ST", "BULTEN.ST",
+        "ELAN-B.ST", "ELOS-B.ST", "HALD.ST", "HTRO.ST", "IAR-B.ST",
+        "INSTAL.ST", "MIDW-B.ST", "NMAN.ST", "PACT.ST", "XANO-B.ST",
+        "EOLU-B.ST", "REJL-B.ST", "SEMI.ST", "KLIM-B.ST", "BALCO.ST",
+        # ── Mid Cap – Technology ──────────────────────────────────────────────────
+        "TRUE-B.ST", "TOBII.ST", "VIT-B.ST", "SECT-B.ST", "ACAST.ST",
+        "HEM.ST", "BOOZT.ST", "G5EN.ST", "SPEQTA.ST", "SOF-B.ST",
+        # ── Mid Cap – Consumer & Retail ───────────────────────────────────────────
+        "CLAS-B.ST", "DUNI.ST", "FOI-B.ST", "NOBI.ST", "SKIS-B.ST",
+        "BYGMX.ST", "BYGGMAX.ST",
+        # ── Mid Cap – Healthcare & Life Science ───────────────────────────────────
+        "CALLIDITAS.ST", "PROBI.ST", "HANSA.ST", "ORX.ST", "OASM.ST",
+        "MOB.ST", "IMMU.ST", "ONCO.ST", "FNOX.ST",
+        # ── Mid Cap – Real Estate ─────────────────────────────────────────────────
+        "CATELLA-B.ST", "SHOT.ST", "NWG.ST", "KFAST-B.ST", "VLTI-B.ST",
+        "STORSKOGEN-B.ST", "SFAB.ST",
+        # ── Mid Cap – Finance ─────────────────────────────────────────────────────
+        "HOFI.ST", "NORX.ST", "CAT-B.ST",
+        # ── Mid Cap – Energy & Utilities ──────────────────────────────────────────
+        "FENIX-B.ST", "FNM.ST",
+        # ── Mid Cap – Media ───────────────────────────────────────────────────────
+        "VPLAY-B.ST",
     ],
     "ZA": [
         "NPN.JO", "SOL.JO", "MTN.JO", "BID.JO", "SBK.JO", "FSR.JO",
@@ -176,20 +227,250 @@ UNIVERSES: Dict[str, List[str]] = {
     ],
 }
 
+# ── Nordic North universe (Sweden + additional Nordic growth/tech on Nasdaq Stockholm) ─
+NORDIC_NORTH: List[str] = list(dict.fromkeys(
+    UNIVERSES.get("SE", []) + [
+        # ── Additional Nordic-listed growth / tech / healthcare on Nasdaq Stockholm ──
+        "CINT.ST", "ENEA.ST", "FORTNOX.ST", "HMS.ST", "KNOW.ST",
+        "LIME.ST", "MSAB-B.ST", "NETI-B.ST", "NOTE.ST", "OLINK.ST",
+        "OVZON.ST", "QLIRO.ST", "SAAB-B.ST", "SDIPTECH.ST", "SLP-B.ST",
+        "VITR.ST", "VIMIAN.ST", "VOLCAR-B.ST", "CIBUS.ST", "CTEK.ST",
+        "ELTEL.ST", "HANZA.ST", "IRRAS.ST", "MVIR-B.ST", "NELLY.ST",
+        "OEM-B.ST", "PREVAS-B.ST", "RATO-B.ST", "SAGA-B.ST", "SOLT.ST",
+        "SVEDBERGS-B.ST", "TAGMASTER.ST", "TELIA.ST", "VICORE.ST",
+        "XBRANE.ST", "ADDNODE-B.ST", "ARISE.ST", "BICO.ST",
+        "CAM-B.ST", "DORO.ST", "EWORK.ST", "GARO.ST", "IAR-B.ST",
+        "IMSOL.ST", "JM.ST", "KDEV.ST", "LATO-B.ST", "MAHA-A.ST",
+        "NFO.ST", "NOLA-B.ST", "PREV-B.ST", "QT.ST", "RVRC.ST",
+        "SECI.ST", "THULE.ST", "WIHL.ST", "XSPRAY.ST",
+    ]
+))
+
+
+# ── Dynamic universe fetching (NASDAQ FTP / Wikipedia / NSE India) ────────────
+
+_UNIVERSE_CACHE: Dict[str, tuple] = {}   # market_code -> (tickers, timestamp)
+_CACHE_LOCK = threading.Lock()
+_CACHE_TTL = 86_400  # 24 hours
+
+
+def _fetch_us_tickers() -> List[str]:
+    """Fetch all NASDAQ and NYSE equity tickers via the NASDAQ screener API.
+
+    Returns stocks with a market cap > 0 (excludes shells and dark instruments
+    like rights/units that have no recorded market cap).
+    Falls back to Wikipedia S&P 500 + S&P 400 if the API is unreachable.
+    """
+    hdr = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+    tickers: List[str] = []
+
+    for exchange in ("nasdaq", "nyse", "amex"):
+        try:
+            r = requests.get(
+                "https://api.nasdaq.com/api/screener/stocks",
+                params={"tableonly": "true", "limit": 10_000, "offset": 0, "exchange": exchange, "download": "true"},
+                headers=hdr,
+                timeout=30,
+            )
+            r.raise_for_status()
+            rows = r.json().get("data", {}).get("rows") or []
+            for row in rows:
+                sym = str(row.get("symbol", "")).strip()
+                if not sym or not sym[0].isalpha():
+                    continue
+                # Skip rights, warrants, units which have no recorded market cap
+                try:
+                    mktcap = float(row.get("marketCap") or 0)
+                except (ValueError, TypeError):
+                    mktcap = 0
+                if mktcap <= 0:
+                    continue
+                tickers.append(sym)
+        except Exception:
+            pass
+
+    if tickers:
+        return list(dict.fromkeys(tickers))
+
+    # ── Fallback: S&P 500 + S&P 400 from Wikipedia ─────────────────────────────
+    try:
+        tbls = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", flavor="lxml"
+        )
+        sp500 = [str(t).replace(".", "-") for t in tbls[0]["Symbol"].tolist()]
+        try:
+            t400 = pd.read_html(
+                "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", flavor="lxml"
+            )
+            col = next(
+                c for c in t400[0].columns
+                if any(k in str(c).lower() for k in ("ticker", "symbol"))
+            )
+            sp400 = [str(t).replace(".", "-") for t in t400[0][col].tolist()]
+            sp500 = list(dict.fromkeys(sp500 + sp400))
+        except Exception:
+            pass
+        return sp500
+    except Exception:
+        return []
+
+
+def _fetch_gb_tickers() -> List[str]:
+    """Fetch FTSE 100 + FTSE 250 tickers from Wikipedia (appends .L suffix)."""
+    tickers: List[str] = []
+    urls = [
+        "https://en.wikipedia.org/wiki/FTSE_100_Index",
+        "https://en.wikipedia.org/wiki/FTSE_250_Index",
+    ]
+    for url in urls:
+        try:
+            tables = pd.read_html(url, flavor="lxml")
+            for tbl in tables:
+                col = next(
+                    (
+                        c for c in tbl.columns
+                        if any(k in str(c).lower() for k in ("ticker", "epic", "symbol"))
+                    ),
+                    None,
+                )
+                if col is None or len(tbl) < 10:
+                    continue
+                raw = [str(v).strip().replace(".", "-") for v in tbl[col].dropna()]
+                valid = [
+                    v + ".L" for v in raw
+                    if 1 <= len(v) <= 8 and v.replace("-", "").isalnum()
+                ]
+                if len(valid) >= 10:
+                    tickers.extend(valid)
+                    break
+        except Exception:
+            pass
+    return list(dict.fromkeys(tickers))
+
+
+def _fetch_in_nse_tickers() -> List[str]:
+    """Fetch ALL NSE-listed equities via the EQUITY_L.csv master list (~2100 stocks).
+
+    Falls back to Nifty 500 CSV if the master list is unavailable.
+    """
+    hdr = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.nseindia.com/",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    session = requests.Session()
+    try:
+        session.get("https://www.nseindia.com", headers={"User-Agent": hdr["User-Agent"]}, timeout=10)
+    except Exception:
+        pass
+
+    # Primary: full equity master list (all NSE-listed equities, EQ series)
+    try:
+        resp = session.get(
+            "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+            headers=hdr, timeout=20,
+        )
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        # Column ' SERIES' has a leading space
+        series_col = next(c for c in df.columns if "series" in c.lower())
+        sym_col = "SYMBOL"
+        eq = df[df[series_col].str.strip() == "EQ"]
+        tickers = [str(t).strip() + ".NS" for t in eq[sym_col].tolist() if str(t).strip()]
+        if len(tickers) > 100:
+            return tickers
+    except Exception:
+        pass
+
+    # Fallback: Nifty 500 index constituents
+    resp = session.get(
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+        headers=hdr, timeout=20,
+    )
+    resp.raise_for_status()
+    df = pd.read_csv(StringIO(resp.text))
+    col = next(c for c in df.columns if "symbol" in str(c).lower())
+    return [str(t).strip() + ".NS" for t in df[col].tolist() if str(t).strip()]
+
+
+_FETCHERS = {
+    "US": _fetch_us_tickers,
+    "GB": _fetch_gb_tickers,
+    "IN_NSE": _fetch_in_nse_tickers,
+}
+
+
+def fetch_dynamic_universe(market_code: str) -> List[str]:
+    """
+    Return a comprehensive ticker list for *market_code*.
+
+    For US, GB, and IN_NSE the list is fetched from public sources (Wikipedia /
+    NSE India) and cached in memory for 24 hours.  All other markets (and any
+    failed fetch) fall back to the hardcoded UNIVERSES list.
+    """
+    now = time.time()
+    with _CACHE_LOCK:
+        if market_code in _UNIVERSE_CACHE:
+            cached, ts = _UNIVERSE_CACHE[market_code]
+            if now - ts < _CACHE_TTL:
+                return cached
+
+    tickers: Optional[List[str]] = None
+    if market_code in _FETCHERS:
+        try:
+            tickers = _FETCHERS[market_code]()
+            if not tickers:
+                tickers = None
+        except Exception:
+            tickers = None
+
+    if tickers:
+        with _CACHE_LOCK:
+            _UNIVERSE_CACHE[market_code] = (tickers, now)
+        return tickers
+
+    return UNIVERSES.get(market_code, [])
+
+
+def get_universe(market_code: str) -> List[str]:
+    """Get comprehensive ticker list for a single market code."""
+    return fetch_dynamic_universe(market_code)
+
 
 def get_universe_for_markets(market_codes: List[str]) -> List[str]:
     """Return deduplicated ticker list for the given market codes."""
     tickers = []
     for code in market_codes:
-        tickers.extend(UNIVERSES.get(code, []))
+        tickers.extend(get_universe(code))
     return list(dict.fromkeys(tickers))
+
+
+def _to_float(v) -> Optional[float]:
+    """Safely coerce a yfinance value to float; returns None for non-numeric or infinite values."""
+    if v is None:
+        return None
+    try:
+        result = float(v)
+        if result != result or abs(result) == float("inf"):  # NaN or Inf
+            return None
+        return result
+    except (ValueError, TypeError):
+        return None
 
 
 def _fetch_metrics(ticker: str) -> Optional[dict]:
     """Fetch fundamental metrics for one ticker via yfinance. Returns None on failure."""
+    _rate_limit()
     try:
         info = yf.Ticker(ticker).info
-        price = (
+        price = _to_float(
             info.get("currentPrice")
             or info.get("regularMarketPrice")
             or info.get("previousClose")
@@ -197,53 +478,58 @@ def _fetch_metrics(ticker: str) -> Optional[dict]:
         if not price:
             return None
 
-        de_raw = info.get("debtToEquity")
+        de_raw = _to_float(info.get("debtToEquity"))
         de = de_raw / 100 if de_raw is not None else None
 
-        def _pct(key):
-            v = info.get(key)
+        def _pct(key) -> Optional[float]:
+            v = _to_float(info.get(key))
             return round(v * 100, 2) if v is not None else None
 
-        peg = info.get("pegRatio")
+        peg = _to_float(info.get("pegRatio"))
         if peg is None:
-            pe = info.get("trailingPE")
-            eg = info.get("earningsGrowth")
+            pe = _to_float(info.get("trailingPE"))
+            eg = _to_float(info.get("earningsGrowth"))
             if pe and eg and eg > 0:
                 peg = round(pe / (eg * 100), 2)
 
-        mktcap = info.get("marketCap")
+        mktcap = _to_float(info.get("marketCap"))
         mktcap_b = round(mktcap / 1e9, 2) if mktcap else None
 
         return {
-            "Ticker":        ticker,
-            "Name":          info.get("shortName") or info.get("longName") or ticker,
-            "Sector":        info.get("sector", "—"),
+            "Ticker":         ticker,
+            "Name":           info.get("shortName") or info.get("longName") or ticker,
+            "Sector":         info.get("sector", "—"),
             "Market Cap (B)": mktcap_b,
-            "P/E (TTM)":     info.get("trailingPE"),
-            "Fwd P/E":       info.get("forwardPE"),
-            "P/B":           info.get("priceToBook"),
-            "PEG":           peg,
-            "ROE %":         _pct("returnOnEquity"),
-            "ROA %":         _pct("returnOnAssets"),
-            "Net Margin %":  _pct("profitMargins"),
-            "Gross Margin %":_pct("grossMargins"),
-            "Rev Growth %":  _pct("revenueGrowth"),
-            "Earn Growth %": _pct("earningsGrowth"),
-            "D/E":           de,
-            "Current Ratio": info.get("currentRatio"),
-            "Div Yield %":   _pct("dividendYield"),
-            "Currency":      info.get("currency", ""),
-            "_price":        price,
-            "_mktcap_raw":   mktcap,
+            "P/E (TTM)":      _to_float(info.get("trailingPE")),
+            "Fwd P/E":        _to_float(info.get("forwardPE")),
+            "P/B":            _to_float(info.get("priceToBook")),
+            "PEG":            peg,
+            "ROE %":          _pct("returnOnEquity"),
+            "ROA %":          _pct("returnOnAssets"),
+            "Net Margin %":   _pct("profitMargins"),
+            "Gross Margin %": _pct("grossMargins"),
+            "Rev Growth %":   _pct("revenueGrowth"),
+            "Earn Growth %":  _pct("earningsGrowth"),
+            "D/E":            de,
+            "Current Ratio":  _to_float(info.get("currentRatio")),
+            "Div Yield %":    _pct("dividendYield"),
+            "Currency":       info.get("currency", ""),
+            "_price":         price,
+            "_mktcap_raw":    mktcap,
         }
     except Exception:
         return None
+    finally:
+        _rate_release()
+
+
+from src.yf_auth import warmup as _warmup_yfinance, rate_limit as _rate_limit, rate_release as _rate_release
 
 
 def screen_stocks(
     tickers: List[str],
     filters: dict,
-    max_workers: int = 20,
+    max_workers: int = 8,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> pd.DataFrame:
     """
@@ -256,6 +542,8 @@ def screen_stocks(
     }
     progress_cb(done, total) is called after each ticker completes.
     """
+    _warmup_yfinance()
+
     rows = []
     total = len(tickers)
     done = 0

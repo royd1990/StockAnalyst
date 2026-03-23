@@ -2,7 +2,6 @@ import yfinance as yf
 import pandas as pd
 from typing import Any, Dict, Optional
 
-
 def get_stock_data(ticker: str) -> Dict[str, Any]:
     """Fetch comprehensive stock data using yfinance."""
     try:
