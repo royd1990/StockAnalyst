@@ -13,6 +13,13 @@ from src.strategy_accumulation import run_accumulation_strategy, BENCHMARK_MAP
 from src.strategy_breakout import run_breakout_strategy
 from src.strategy_swedish import run_swedish_strategy
 from src.strategy_value import run_value_strategy
+from src.strategy_fundamental import run_fundamental_screen
+from src.valuation_engine import (
+    DCFInputs, compute_dcf, dcf_sensitivity, reverse_dcf,
+    ev_ebitda_valuation, pe_valuation, ev_sales_valuation, valuation_summary,
+    build_dcf_inputs, build_relative_inputs,
+)
+from src.peer_analysis import find_peers, fetch_peer_data, build_comparison_table
 from src.stock_data import (
     get_key_metrics,
     get_stock_data,
@@ -806,7 +813,7 @@ def _render_technical_strategy() -> None:
         unsafe_allow_html=True,
     )
 
-    tab_breakout, tab_value, tab_accum, tab_swedish = st.tabs(["📈 Breakout Analyzer", "💰 Value Investing", "🔍 Accumulation Detection", "🇸🇪 Swedish Growth"])
+    tab_breakout, tab_value, tab_accum, tab_swedish, tab_fundval = st.tabs(["📈 Breakout Analyzer", "💰 Value Investing", "🔍 Accumulation Detection", "🇸🇪 Swedish Growth", "📊 Fundamental & Valuation"])
 
     # ── Tab 1: Breakout Analyzer ─────────────────────────────────────────────
     with tab_breakout:
@@ -1620,6 +1627,528 @@ Gross Margin >= 40%, D/E < 1, Liquidity >= 5M SEK/day, Price >= 85% of 52W High,
                             "Op Margin Improving = current year > prior year (from income statement). "
                             "Copy ticker to Stock Analysis for a deep dive."
                         )
+
+
+    # ── Tab 5: Fundamental & Valuation ─────────────────────────────────────────
+    with tab_fundval:
+        st.markdown(
+            """<div class="info-banner">
+            <b>Fundamental & Valuation</b> — Three-step research workflow:<br><br>
+            <b>Step 1 — Screen</b>: Filter stocks by quality (ROIC, operating margin, FCF, leverage)
+            and growth (revenue & earnings CAGR). All thresholds are editable.<br>
+            <b>Step 2 — Value</b>: Run DCF, EV/EBITDA, P/E, and EV/Sales valuation models with
+            auto-populated inputs and sensitivity analysis.<br>
+            <b>Step 3 — Peers</b>: Compare with industry peers on multiples and operating metrics.<br><br>
+            <b>Data source:</b> yfinance financial statements (income statement, balance sheet, cash flow).
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+        # ── STEP 1: Fundamental Screening ──────────────────────────────────
+        st.markdown("### Step 1: Fundamental Screen")
+
+        col_cfg_fv, col_results_fv = st.columns([1, 3])
+
+        with col_cfg_fv:
+            st.markdown("##### Markets")
+            fv_market_names = st.multiselect(
+                "Select markets",
+                options=list(_MARKETS.keys()),
+                default=["🇺🇸 United States (NYSE / NASDAQ)"],
+                label_visibility="collapsed",
+                key="fv_markets",
+            )
+
+            st.markdown("##### Quality Filters")
+            fv_min_roic = st.slider(
+                "Min ROIC (%)", min_value=0.0, max_value=30.0, value=12.0, step=1.0,
+                key="fv_roic", help="Return on Invested Capital = NOPAT / (Equity + Debt).",
+            )
+            fv_min_op_margin = st.slider(
+                "Min Operating Margin (%)", min_value=0.0, max_value=40.0, value=10.0, step=1.0,
+                key="fv_op_margin", help="EBIT / Revenue.",
+            )
+            fv_max_nd_ebitda = st.slider(
+                "Max Net Debt / EBITDA", min_value=0.0, max_value=10.0, value=3.0, step=0.5,
+                key="fv_nd_ebitda", help="(Total Debt − Cash) / EBITDA. Lower = healthier balance sheet.",
+            )
+
+            st.markdown("##### Growth Filters")
+            fv_min_rev_cagr = st.slider(
+                "Min Revenue CAGR 3yr (%)", min_value=0.0, max_value=40.0, value=5.0, step=1.0,
+                key="fv_rev_cagr", help="Compound annual growth rate over 3 years.",
+            )
+            fv_min_earn_cagr = st.slider(
+                "Min Earnings CAGR 3yr (%)", min_value=0.0, max_value=40.0, value=5.0, step=1.0,
+                key="fv_earn_cagr", help="Net Income CAGR over 3 years.",
+            )
+
+            fv_market_codes = [_MARKETS[m]["code"] for m in fv_market_names if m in _MARKETS]
+            fv_universe = get_universe_for_markets(fv_market_codes) if fv_market_codes else []
+            st.caption(f"Universe: **{len(fv_universe)} stocks**")
+
+            fv_run_btn = st.button(
+                "▶  Run Screen", type="primary", use_container_width=True, key="fv_run"
+            )
+
+        with col_results_fv:
+            _fv_cached = "fv_screen_results" in st.session_state and st.session_state["fv_screen_results"] is not None
+
+            if not fv_run_btn and not _fv_cached:
+                st.info(
+                    "Configure quality & growth thresholds on the left, then click **Run Screen**.\n\n"
+                    "The scan fetches financial statements for every stock — this may take a few minutes."
+                )
+            elif not fv_universe:
+                st.warning("Select at least one market to scan.")
+            else:
+                if fv_run_btn:
+                    total_fv = len(fv_universe)
+                    st.markdown(f"Scanning **{total_fv} stocks** (fetching financials)…")
+                    prog_bar_fv = st.progress(0.0)
+                    prog_text_fv = st.empty()
+
+                    def _fv_progress(done: int, t: int):
+                        prog_bar_fv.progress(done / t)
+                        prog_text_fv.caption(f"{done} / {t} tickers processed…")
+
+                    with st.spinner(""):
+                        fv_result_df = run_fundamental_screen(
+                            fv_universe,
+                            min_roic=fv_min_roic,
+                            min_op_margin=fv_min_op_margin,
+                            max_net_debt_ebitda=fv_max_nd_ebitda,
+                            min_rev_cagr=fv_min_rev_cagr,
+                            min_earn_cagr=fv_min_earn_cagr,
+                            max_workers=6,
+                            progress_cb=_fv_progress,
+                        )
+
+                    prog_bar_fv.empty()
+                    prog_text_fv.empty()
+                    st.session_state["fv_screen_results"] = fv_result_df
+
+                fv_result_df = st.session_state.get("fv_screen_results")
+                if fv_result_df is None or fv_result_df.empty:
+                    st.warning("No stocks found. Try relaxing the thresholds.")
+                else:
+                    # Signal counts
+                    sig_counts = fv_result_df["Signal"].value_counts()
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total Screened", len(fv_result_df))
+                    c2.metric("STRONG PASS", sig_counts.get("STRONG PASS", 0))
+                    c3.metric("PASS", sig_counts.get("PASS", 0))
+                    c4.metric("PARTIAL", sig_counts.get("PARTIAL", 0))
+
+                    # Filter to show only PASS+ by default
+                    fv_show_filter = st.selectbox(
+                        "Show",
+                        ["STRONG PASS + PASS", "All (incl. PARTIAL & FAIL)", "STRONG PASS only"],
+                        key="fv_signal_filter",
+                    )
+                    if fv_show_filter == "STRONG PASS + PASS":
+                        df_fv_show = fv_result_df[fv_result_df["Signal"].isin(["STRONG PASS", "PASS"])]
+                    elif fv_show_filter == "STRONG PASS only":
+                        df_fv_show = fv_result_df[fv_result_df["Signal"] == "STRONG PASS"]
+                    else:
+                        df_fv_show = fv_result_df
+
+                    # Format market cap with per-row currency symbol
+                    df_fv_display = df_fv_show.copy()
+                    if "Market Cap" in df_fv_display.columns:
+                        def _fmt_mktcap(row):
+                            v = row.get("Market Cap")
+                            sym = _CURRENCY_SYMBOLS.get(row.get("Currency", "USD"), "$")
+                            if isinstance(v, (int, float)) and v >= 1e9:
+                                return f"{sym}{v/1e9:.2f}B"
+                            elif isinstance(v, (int, float)) and v >= 1e6:
+                                return f"{sym}{v/1e6:.0f}M"
+                            return "—"
+                        df_fv_display["Market Cap"] = df_fv_display.apply(_fmt_mktcap, axis=1)
+
+                    display_cols_fv = [
+                        "Ticker", "Name", "Sector", "Price", "Market Cap",
+                        "ROIC %", "Op Margin %", "FCF 3yr", "Net Debt/EBITDA",
+                        "Rev CAGR %", "Earn CAGR %", "Passed", "Signal",
+                    ]
+                    display_cols_fv = [c for c in display_cols_fv if c in df_fv_display.columns]
+
+                    st.dataframe(
+                        df_fv_display[display_cols_fv],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Signal":          st.column_config.TextColumn("Signal", width="medium"),
+                            "Price":           st.column_config.NumberColumn("Price", format="%.2f"),
+                            "ROIC %":          st.column_config.NumberColumn("ROIC %", format="%.1f %%"),
+                            "Op Margin %":     st.column_config.NumberColumn("Op Mgn %", format="%.1f %%"),
+                            "Net Debt/EBITDA": st.column_config.NumberColumn("ND/EBITDA", format="%.2f x"),
+                            "Rev CAGR %":      st.column_config.NumberColumn("Rev CAGR %", format="%.1f %%"),
+                            "Earn CAGR %":     st.column_config.NumberColumn("Earn CAGR %", format="%.1f %%"),
+                        },
+                    )
+                    st.caption(
+                        "STRONG PASS = 6/6 rules passed · PASS = 5/6 · PARTIAL = 3–4/6 · FAIL = <3. "
+                        "ROIC = NOPAT / Invested Capital. FCF = Operating Cash Flow − CapEx."
+                    )
+
+        # ── STEP 2: Valuation Engine ───────────────────────────────────────
+        st.divider()
+        st.markdown("### Step 2: Valuation")
+
+        fv_result_df = st.session_state.get("fv_screen_results")
+
+        if fv_result_df is None or fv_result_df.empty:
+            st.info("Run the fundamental screen first (Step 1) to select a stock for valuation.")
+        else:
+            # Stock selector
+            fv_tickers = fv_result_df["Ticker"].tolist()
+            fv_selected = st.selectbox(
+                "Select stock to value",
+                options=fv_tickers,
+                key="fv_val_ticker",
+                help="Pick a stock from the screening results.",
+            )
+
+            if fv_selected:
+                # Get raw data for selected stock
+                raw_row = fv_result_df[fv_result_df["Ticker"] == fv_selected]
+                if "_raw" in raw_row.columns:
+                    raw_data = raw_row.iloc[0]["_raw"]
+                else:
+                    raw_data = raw_row.iloc[0].to_dict()
+
+                # Normalise keys for factory functions
+                raw_norm = {
+                    "fcf_latest": raw_data.get("FCF History", [None])[0] if raw_data.get("FCF History") else None,
+                    "rev_cagr": raw_data.get("Rev CAGR"),
+                    "net_debt": raw_data.get("Net Debt"),
+                    "shares_outstanding": raw_data.get("Shares Outstanding"),
+                    "total_debt": raw_data.get("Total Debt"),
+                    "total_cash": raw_data.get("Total Cash"),
+                    "ebitda": raw_data.get("EBITDA"),
+                    "eps": raw_data.get("EPS"),
+                    "forward_eps": raw_data.get("Forward EPS"),
+                    "revenue": raw_data.get("Revenue"),
+                    "price": raw_data.get("Price"),
+                    "ev_ebitda": raw_data.get("EV/EBITDA"),
+                    "pe_ratio": raw_data.get("P/E"),
+                    "ev_sales": raw_data.get("EV/Sales"),
+                    "enterprise_value": raw_data.get("Enterprise Value"),
+                }
+
+                current_price = raw_data.get("Price", 0)
+                dcf_defaults = build_dcf_inputs(raw_norm)
+                rel_defaults = build_relative_inputs(raw_norm)
+
+                # Resolve currency symbol for display
+                csym = _CURRENCY_SYMBOLS.get(raw_data.get("Currency", "USD"), "$")
+
+                # Show key financials
+                fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+                fc1.metric("Price", f"{csym}{current_price:.2f}")
+                fc2.metric("EBITDA", f"{csym}{(raw_data.get('EBITDA') or 0)/1e6:.0f}M" if raw_data.get('EBITDA') else "N/A")
+                fc3.metric("FCF (latest)", f"{csym}{dcf_defaults.fcf_latest/1e6:.0f}M" if dcf_defaults.fcf_latest else "N/A")
+                fc4.metric("Net Debt", f"{csym}{dcf_defaults.net_debt/1e6:.0f}M" if dcf_defaults.net_debt else "N/A")
+                fc5.metric("Shares", f"{(dcf_defaults.shares_outstanding or 0)/1e6:.0f}M")
+
+                val_dcf, val_ev_ebitda, val_pe, val_ev_sales, val_summary_tab = st.tabs([
+                    "📉 DCF", "📊 EV/EBITDA", "📈 P/E", "💹 EV/Sales", "📋 Summary"
+                ])
+
+                # ── DCF Tab ──────────────────────────────────────────────
+                with val_dcf:
+                    st.markdown("##### DCF Assumptions")
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        fv_fcf0 = st.number_input(
+                            "FCF₀ (latest FCF)",
+                            value=float(dcf_defaults.fcf_latest) if dcf_defaults.fcf_latest else 0.0,
+                            format="%.0f",
+                            key="fv_dcf_fcf0",
+                            help="Latest Free Cash Flow. Auto-populated from financial statements.",
+                        )
+                        fv_growth = st.slider(
+                            "FCF Growth Rate (%)",
+                            min_value=-20.0, max_value=50.0,
+                            value=round(dcf_defaults.growth_rate * 100, 1),
+                            step=0.5,
+                            key="fv_dcf_growth",
+                            help=f"Default from historical revenue CAGR. Currently: {dcf_defaults.growth_rate*100:.1f}%",
+                        )
+                        fv_forecast_yrs = st.slider(
+                            "Forecast Period (years)",
+                            min_value=3, max_value=15, value=dcf_defaults.forecast_years, step=1,
+                            key="fv_dcf_years",
+                        )
+                    with dc2:
+                        fv_discount = st.slider(
+                            "Discount Rate / WACC (%)",
+                            min_value=5.0, max_value=20.0,
+                            value=round(dcf_defaults.discount_rate * 100, 1),
+                            step=0.5,
+                            key="fv_dcf_discount",
+                        )
+                        fv_terminal = st.slider(
+                            "Terminal Growth Rate (%)",
+                            min_value=0.0, max_value=6.0,
+                            value=round(dcf_defaults.terminal_growth * 100, 1),
+                            step=0.5,
+                            key="fv_dcf_terminal",
+                        )
+
+                    if fv_terminal >= fv_discount:
+                        st.error("Terminal growth must be less than discount rate.")
+                    elif fv_fcf0 == 0:
+                        st.warning("FCF is zero — cannot run DCF. Check if financial data is available.")
+                    else:
+                        dcf_inputs = DCFInputs(
+                            fcf_latest=fv_fcf0,
+                            growth_rate=fv_growth / 100,
+                            discount_rate=fv_discount / 100,
+                            terminal_growth=fv_terminal / 100,
+                            forecast_years=fv_forecast_yrs,
+                            net_debt=dcf_defaults.net_debt,
+                            shares_outstanding=dcf_defaults.shares_outstanding,
+                        )
+
+                        try:
+                            dcf_result = compute_dcf(dcf_inputs, current_price)
+                            st.session_state["fv_dcf_result"] = dcf_result
+
+                            # Results
+                            r1, r2, r3 = st.columns(3)
+                            r1.metric(
+                                "Intrinsic Value / Share",
+                                f"{csym}{dcf_result.value_per_share:.2f}",
+                                delta=f"{dcf_result.upside_pct:+.1f}% vs market",
+                            )
+                            r2.metric("Current Price", f"{csym}{current_price:.2f}")
+                            r3.metric("Enterprise Value", f"{csym}{dcf_result.enterprise_value/1e9:.2f}B")
+
+                            # Year-by-year FCF
+                            with st.expander("Year-by-Year FCF Forecast"):
+                                fcf_table = pd.DataFrame({
+                                    "Year": [f"Year {y}" for y, _ in dcf_result.forecasted_fcfs],
+                                    "FCF": [f"{csym}{f/1e6:.1f}M" for _, f in dcf_result.forecasted_fcfs],
+                                    "PV(FCF)": [f"{csym}{p/1e6:.1f}M" for _, p in dcf_result.pv_fcfs],
+                                })
+                                st.dataframe(fcf_table, use_container_width=True, hide_index=True)
+                                st.caption(
+                                    f"Terminal Value: {csym}{dcf_result.terminal_value/1e9:.2f}B · "
+                                    f"PV(Terminal): {csym}{dcf_result.pv_terminal/1e9:.2f}B · "
+                                    f"Equity Value: {csym}{dcf_result.equity_value/1e9:.2f}B"
+                                )
+
+                            # Sensitivity table
+                            st.markdown("##### Sensitivity Analysis")
+                            sens_df = dcf_sensitivity(dcf_inputs, current_price)
+                            st.dataframe(
+                                sens_df.style.format(f"{csym}{{:.2f}}").highlight_min(axis=None, color="#ff6b6b")
+                                .highlight_max(axis=None, color="#51cf66"),
+                                use_container_width=True,
+                            )
+                            st.caption("Rows = Discount Rate · Columns = Terminal Growth Rate · Values = Implied Share Price")
+
+                            # Reverse DCF
+                            implied_g = reverse_dcf(
+                                fv_fcf0, fv_discount / 100, fv_terminal / 100,
+                                fv_forecast_yrs, dcf_defaults.net_debt,
+                                dcf_defaults.shares_outstanding, current_price,
+                            )
+                            st.info(
+                                f"**Reverse DCF**: The market price of {csym}{current_price:.2f} implies "
+                                f"**{implied_g*100:.1f}% annual FCF growth** "
+                                f"(at {fv_discount:.1f}% WACC, {fv_terminal:.1f}% terminal growth)."
+                            )
+                        except ValueError as e:
+                            st.error(f"DCF Error: {e}")
+
+                # ── EV/EBITDA Tab ────────────────────────────────────────
+                with val_ev_ebitda:
+                    ebitda_val = rel_defaults.get("ebitda")
+                    if ebitda_val is None or ebitda_val <= 0:
+                        st.warning("EBITDA is not available or negative — EV/EBITDA valuation is not applicable.")
+                    else:
+                        current_mult = rel_defaults.get("current_ev_ebitda") or 10.0
+                        fv_ev_mult = st.slider(
+                            "EV/EBITDA Multiple",
+                            min_value=1.0, max_value=40.0,
+                            value=min(round(current_mult, 1), 40.0),
+                            step=0.5,
+                            key="fv_ev_mult",
+                            help=f"Current company multiple: {current_mult:.1f}x. Set to peer median after Step 3.",
+                        )
+                        ev_result = ev_ebitda_valuation(
+                            ebitda_val, fv_ev_mult, rel_defaults["net_debt"],
+                            rel_defaults["shares_outstanding"], current_price,
+                        )
+                        st.session_state["fv_ev_result"] = ev_result
+
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Implied Price", f"{csym}{ev_result.implied_share_price:.2f}",
+                                  delta=f"{ev_result.upside_pct:+.1f}%")
+                        m2.metric("Current Price", f"{csym}{current_price:.2f}")
+                        m3.metric("Implied EV", f"{csym}{ev_result.implied_ev/1e9:.2f}B")
+
+                # ── P/E Tab ──────────────────────────────────────────────
+                with val_pe:
+                    eps_val = rel_defaults.get("eps")
+                    if eps_val is None or eps_val <= 0:
+                        st.warning("EPS is not available or negative — P/E valuation is not applicable.")
+                    else:
+                        current_pe_mult = rel_defaults.get("current_pe") or 15.0
+                        fv_pe_mult = st.slider(
+                            "P/E Multiple",
+                            min_value=1.0, max_value=60.0,
+                            value=min(round(current_pe_mult, 1), 60.0),
+                            step=0.5,
+                            key="fv_pe_mult",
+                            help=f"Current company P/E: {current_pe_mult:.1f}x.",
+                        )
+                        pe_result = pe_valuation(eps_val, fv_pe_mult, current_price)
+                        st.session_state["fv_pe_result"] = pe_result
+
+                        m1, m2 = st.columns(2)
+                        m1.metric("Implied Price", f"{csym}{pe_result.implied_share_price:.2f}",
+                                  delta=f"{pe_result.upside_pct:+.1f}%")
+                        m2.metric("Current Price", f"{csym}{current_price:.2f}")
+
+                # ── EV/Sales Tab ─────────────────────────────────────────
+                with val_ev_sales:
+                    rev_val = rel_defaults.get("revenue")
+                    if rev_val is None or rev_val <= 0:
+                        st.warning("Revenue is not available — EV/Sales valuation is not applicable.")
+                    else:
+                        current_evs_mult = rel_defaults.get("current_ev_sales") or 2.0
+                        fv_evs_mult = st.slider(
+                            "EV/Sales Multiple",
+                            min_value=0.1, max_value=30.0,
+                            value=min(round(current_evs_mult, 1), 30.0),
+                            step=0.1,
+                            key="fv_evs_mult",
+                            help=f"Current company EV/Sales: {current_evs_mult:.1f}x.",
+                        )
+                        evs_result = ev_sales_valuation(
+                            rev_val, fv_evs_mult, rel_defaults["net_debt"],
+                            rel_defaults["shares_outstanding"], current_price,
+                        )
+                        st.session_state["fv_evs_result"] = evs_result
+
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Implied Price", f"{csym}{evs_result.implied_share_price:.2f}",
+                                  delta=f"{evs_result.upside_pct:+.1f}%")
+                        m2.metric("Current Price", f"{csym}{current_price:.2f}")
+                        m3.metric("Implied EV", f"{csym}{evs_result.implied_ev/1e9:.2f}B")
+
+                # ── Summary Tab ──────────────────────────────────────────
+                with val_summary_tab:
+                    dcf_r = st.session_state.get("fv_dcf_result")
+                    rel_results = []
+                    for key in ["fv_ev_result", "fv_pe_result", "fv_evs_result"]:
+                        r = st.session_state.get(key)
+                        if r is not None:
+                            rel_results.append(r)
+
+                    if dcf_r is None and not rel_results:
+                        st.info("Run at least one valuation model to see the summary.")
+                    else:
+                        summary = valuation_summary(dcf_r, rel_results, current_price)
+
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric("Avg Implied Price", f"{csym}{summary['avg_implied_price']:.2f}",
+                                  delta=f"{summary['avg_upside_pct']:+.1f}%")
+                        s2.metric("Median Implied Price", f"{csym}{summary['median_implied_price']:.2f}")
+                        s3.metric("Range", f"{csym}{summary['min_implied_price']:.2f} – {csym}{summary['max_implied_price']:.2f}")
+
+                        # Model comparison table
+                        model_df = pd.DataFrame(summary["models"])
+                        model_df["implied_price"] = model_df["implied_price"].apply(lambda x: f"{csym}{x:.2f}")
+                        model_df["upside_pct"] = model_df["upside_pct"].apply(lambda x: f"{x:+.1f}%")
+                        model_df.columns = ["Model", "Implied Price", "Upside/Downside"]
+                        st.dataframe(model_df, use_container_width=True, hide_index=True)
+
+        # ── STEP 3: Peer Comparison ────────────────────────────────────────
+        st.divider()
+        st.markdown("### Step 3: Peer Comparison")
+
+        fv_result_df = st.session_state.get("fv_screen_results")
+        fv_selected = st.session_state.get("fv_val_ticker")
+
+        if fv_result_df is None or fv_result_df.empty or not fv_selected:
+            st.info("Complete Steps 1 and 2 first — select a stock from the screening results.")
+        else:
+            # Get target data
+            raw_row = fv_result_df[fv_result_df["Ticker"] == fv_selected]
+            if "_raw" in raw_row.columns:
+                target_raw = raw_row.iloc[0]["_raw"]
+            else:
+                target_raw = raw_row.iloc[0].to_dict()
+
+            target_sector = target_raw.get("Sector", "")
+            target_industry = target_raw.get("Industry", "")
+
+            st.markdown(f"**{fv_selected}** — {target_sector} / {target_industry}")
+
+            # Auto-detect peers
+            auto_peers = find_peers(fv_selected, target_sector, target_industry, fv_result_df)
+
+            pc1, pc2 = st.columns([2, 1])
+            with pc1:
+                fv_peer_input = st.text_input(
+                    "Peer tickers (comma-separated)",
+                    value=", ".join(auto_peers[:8]),
+                    key="fv_peer_tickers",
+                    help="Auto-detected from screening results. Edit to add/remove peers.",
+                )
+            with pc2:
+                fv_peer_btn = st.button("▶  Fetch Peers", type="primary", key="fv_peer_run")
+
+            peer_tickers = [t.strip() for t in fv_peer_input.split(",") if t.strip()]
+
+            _peer_cached = "fv_peer_results" in st.session_state and st.session_state["fv_peer_results"] is not None
+
+            if fv_peer_btn and peer_tickers:
+                with st.spinner(f"Fetching data for {len(peer_tickers)} peers…"):
+                    peer_df = fetch_peer_data(peer_tickers, max_workers=6)
+                st.session_state["fv_peer_results"] = peer_df
+            elif not _peer_cached:
+                peer_df = None
+
+            peer_df = st.session_state.get("fv_peer_results")
+            if peer_df is not None and not peer_df.empty:
+                comparison = build_comparison_table(target_raw, peer_df)
+
+                # Peer medians
+                pm = comparison["peer_median"]
+                pd_disc = comparison["premium_discount"]
+                pm1, pm2, pm3 = st.columns(3)
+                pm1.metric(
+                    "Peer Median EV/EBITDA",
+                    f"{pm.get('ev_ebitda', 0):.1f}x" if pm.get("ev_ebitda") else "N/A",
+                    delta=f"{pd_disc.get('ev_ebitda', 0):+.0f}% vs target" if pd_disc.get("ev_ebitda") else None,
+                )
+                pm2.metric(
+                    "Peer Median P/E",
+                    f"{pm.get('pe', 0):.1f}x" if pm.get("pe") else "N/A",
+                    delta=f"{pd_disc.get('pe', 0):+.0f}% vs target" if pd_disc.get("pe") else None,
+                )
+                pm3.metric(
+                    "Peer Median EV/Sales",
+                    f"{pm.get('ev_sales', 0):.1f}x" if pm.get("ev_sales") else "N/A",
+                    delta=f"{pd_disc.get('ev_sales', 0):+.0f}% vs target" if pd_disc.get("ev_sales") else None,
+                )
+
+                # Comparison table
+                st.dataframe(comparison["table"], use_container_width=True, hide_index=True)
+
+                # Insights
+                if comparison["insights"]:
+                    st.markdown("##### Insights")
+                    for insight in comparison["insights"]:
+                        st.markdown(f"- {insight}")
+            elif fv_peer_btn:
+                st.warning("No peer data found. Try different peer tickers.")
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
